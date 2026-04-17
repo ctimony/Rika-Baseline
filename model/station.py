@@ -19,12 +19,12 @@ class Station(Object):
         self.order_ids: List[int] = []
         self.orders: List[Order] = []
         self.robot_job = 0
-        self.max_orders = 6 # Picking station capacity
-        self.max_robots = 7
+        self.max_orders = 8 # Picking station capacity
+        self.max_robots = 11
         self.short_path_threshold = 4
         self.robot_ids = {}
-        self.robot_queue = []  # New: Queue for robots waiting for their turn
-        self.max_robot_queue = 6  # New: Maximum number of robots allowed in the queue
+        self.robot_queue = []  # New: Queue for robots waiting for their turn  # NOTE: no use
+        self.max_robot_queue = 6  # New: Maximum number of robots allowed in the queue  # NOTE: no use
         self.is_using_short_route = True
         self.skus = {} # {A:15, B: 10}
         self.skus_in_station = {} # {A:[5,10], B:[10]}
@@ -107,6 +107,7 @@ class Station(Object):
             self.robot_ids[robot_id] = self.get_path()
 
     def get_robot_route(self, robot_id):
+        # print(f"[DEBUG] current_station {self.station_id} robot_id {robot_id} robot_ids {self.robot_ids}")
         return self.robot_ids.get(robot_id, None)
 
     def has_route_changed(self, robot_id):

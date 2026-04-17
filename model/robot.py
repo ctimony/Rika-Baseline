@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
 
 from engine.heading import Heading
 from engine.netlogo_coordinate import NetLogoCoordinate
@@ -12,7 +12,15 @@ from .station import Station
 from .traffic_policy import TrafficPolicy
 from .zone import Zone
 from .pod import Pod
+from .tools.write_record import write_record_to
+from .tools.pod_location import upsert_pod_location
+from .tools.pod_travel import upsert_pod_travel
 
+if TYPE_CHECKING:
+    from model.inventory import Inventory
+    from model.storage import Storage
+
+ACTIVATE_NEAREST = True
 
 class Robot(Object):
     # netlogo related
@@ -62,10 +70,10 @@ class Robot(Object):
     
     
 
-    def __init__(self):
+    def __init__(self, universe: "Inventory"):
         self.id = None
         self.traffic_policy = []
-        self.job: Optional[RobotJob] = None
+        self.job: RobotJob = None
         self.turning_delay = 0
         self.taking_pod_delay = 0
         self.delay_per_task = 10
@@ -77,6 +85,9 @@ class Robot(Object):
         self.current_intersection_stop_and_go = 0
         self.current_intersection_start_time = None
         self.current_intersection_finish_time = None
+        self.warehouse = universe
+        self.return_fix = False 
+        self.return_nearest = True 
         # self.zone_boundary =[]
         # self.zone: Optional[Zone] = None
         super().__init__()
@@ -136,23 +147,24 @@ class Robot(Object):
         self.route_stop_points = route_stop_points
 
     def changeColorByState(self):
-        if self.current_state == "taking_pod":
+        if self.current_state == "taking_pod": # occupied 
             self.color = 57  # green
         elif self.current_state == "delivering_pod":
             station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
             if station.is_replenishment_station():
                 self.color = 138
             else:
-                self.color = 15  # red
+                self.color = 15  # red # have pod and go to picking station 
         elif self.current_state == "returning_pod":
             self.color = 46  # yellow
-        elif self.current_state == "station_processing":
+        elif self.current_state == "station_processing": #inclue queue
             self.color = 94  # blue
         elif self.current_state == "idle":
             self.total_idle += 1
             self.color = 0  # black
 
     def advance_state(self):
+        # print(f"current_state: {self.current_state}")
         if self.current_state == "taking_pod":
             self.taking_pod_delay += self.delay_per_task
             if self.job is not None:
@@ -161,16 +173,45 @@ class Robot(Object):
             e_li = self.load_mass * self._gravity * self._lift_coef
             self.energy_consumption += e_li
             self.current_state = "delivering_pod"
+            upsert_pod_travel(
+                self.job.my_id,
+                self.robotID(self.robotName()),
+                str(self.job.pod.pod_id),
+                "taking_pod",
+                finish_time=self.universe._tick
+            )
         elif self.current_state == "delivering_pod":
             self.current_state = "station_processing"
+            upsert_pod_travel(
+                self.job.my_id,
+                self.robotID(self.robotName()),
+                str(self.job.pod.pod_id),
+                "delivering_pod",
+                finish_time=self.universe._tick
+            )
         elif self.current_state == "station_processing":
             self.current_state = "returning_pod"
         elif self.current_state == "returning_pod":
+            # print(f"[DEBUG] finish returning pod {self.job.pod} to {self.destination}")
+            # print(f"[DEBUG] current pod position {self.job.pod.coordinate}")
+            # print(f"[DEBUG] pos_x pos_y {self.job.pod.pos_x} {self.job.pod.pos_y}")
+            # print(f"{self.warehouse.pod_manager.get_pod_by_id(self.job.pod.pod_id).coordinate}")
+            # input()
+            # raise AssertionError
+            upsert_pod_location(self.job.pod.pod_id, self.job.pod.pos_x, self.job.pod.pos_y)
             e_li = self.load_mass * self._gravity * self._lift_coef
             self.energy_consumption += e_li
             self.load_mass = 0
             self.taking_pod_delay += self.delay_per_task
             self.current_state = "idle"
+            upsert_pod_travel(
+                self.job.my_id,
+                self.robotID(self.robotName()),
+                str(self.job.pod.pod_id),
+                "returning_pod",
+                finish_time=self.universe._tick
+            )
+        # print(f"become {self.current_state}")
 
     def decideCollision(self, collision_block, o, collide_distance):
         will_collide = False
@@ -330,9 +371,13 @@ class Robot(Object):
 
     def movementPlan(self):
         if self.picking_item_in_pod():
+            # print(f"robot {self.id} picking_item_in_pod")
+            # print(f"robot job {self.job} and is_being_process {self.is_being_process_on_station()}")
+            # print(f"delay picking {self.job.picking_delay} delay replenishment {self.job.replenishment_delay}")
             return
-
+        # print(f"robot {self.id} has route_stop_points {self.route_stop_points}")
         if not self.route_stop_points:
+            # print("called from movementPlan")
             self.advance_state_if_needed()
             return
 
@@ -641,22 +686,104 @@ class Robot(Object):
     def advance_state_if_needed(self):
         # Check if all route points are done and handle state transitions
         if not self.route_stop_points:
+            # print("called from advance_state_if_needed")
             self.advance_state()
             self.update_current_position()
             if self.current_state == "delivering_pod":
-                station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
+                # station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
+                # self.set_move_to_station_gate()
+                # """
+                pod = self.job.pod
+                storage_manager = self.warehouse.storage_manager
+                storage = storage_manager.pods_to_storage.get(pod)
+                self.job.record_delivery(self.universe._tick)
+                if storage:
+                    storage.removeStoragePod()
+                    storage.is_empty = True
+                    del storage_manager.pods_to_storage[pod]
+
                 self.set_move_to_station_gate()
+                upsert_pod_travel(
+                    self.job.my_id,
+                    self.robotID(self.robotName()),
+                    str(self.job.pod.pod_id),
+                    "delivering_pod",
+                    str((self.job.pod.pos_x, self.job.pod.pos_y)),
+                    str(
+                        (
+                            self.universe.station_manager.get_station_by_id(self.job.station_id).coordinate.x,
+                            self.universe.station_manager.get_station_by_id(self.job.station_id).coordinate.y
+                        )
+                    ),
+                    self.universe._tick
+                )
+                # """
             elif self.current_state == "returning_pod":
+                # station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
+                # station.remove_robot(self.robotName())
+                
+                # self.set_move(self.job.pod_coordinate, self.universe.graph_pod, need_neutralize_robot=True)
+                # """
                 station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
                 station.remove_robot(self.robotName())
-                
-                self.set_move(self.job.pod_coordinate, self.universe.graph_pod, need_neutralize_robot=True)
+
+                if self.return_fix:
+                    self.job.writePodReturnReport(-1)
+                    self.destination = self.job.pod_coordinate
+                    self.set_move(self.destination, self.warehouse.graph_pod, need_neutralize_robot=False)
+
+                elif self.return_nearest:
+                    nearest_storage: Storage = self.warehouse.storage_manager.getNearestEmptyStorageToLocation(
+                        location_coordinate=station.coordinate,
+                        robot_coordinate=self.coordinate
+                    )
+                    print(f"[DEBUG] nearest_storage: {nearest_storage}")
+                    print(f"[DEBUG] {vars(nearest_storage)}")
+
+                    if nearest_storage is not None:
+                        self.destination = NetLogoCoordinate(nearest_storage.pos_x, nearest_storage.pos_y)  # nearest_storage.coordinate
+                        print(f"[DEBUG] destination: {self.destination}")
+                        self.job.pod_return_coordinate = self.destination
+                        self.job.writePodReturnReport(
+                            calculateManhattanDistance((self.job.pod_return_coordinate.x,self.job.pod_return_coordinate.y),
+                                                                                (self.job.pod_coordinate.x, self.job.pod_coordinate.y)))
+
+                        self.set_move(self.destination, self.universe.graph_pod, need_neutralize_robot=False)
+                        nearest_storage.setStoragePod(self.job.pod)
+                        self.warehouse.storage_manager.pods_to_storage[self.job.pod] = nearest_storage
+                        nearest_storage.is_empty = False
+                    else:
+                        self.job.writePodReturnReport(-1)
+                        self.destination = NetLogoCoordinate(self.job.pod.pos_x, self.job.pod.pos_y)
+                        self.set_move(self.destination, self.warehouse.graph_pod, need_neutralize_robot=False)
+
+                self.initial_w1 = False
+                upsert_pod_travel(
+                    self.job.my_id,
+                    self.robotID(self.robotName()),
+                    str(self.job.pod.pod_id),
+                    "returning_pod",
+                    str((self.job.pod.pos_x, self.job.pod.pos_y)),
+                    str(
+                        (
+                            self.destination.x,
+                            self.destination.y
+                        )
+                    ),
+                    self.universe._tick
+                )
+                # """
             elif self.current_state == "station_processing":
+                # station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
+                # if station.is_replenishment_station():
+                #     print(f"Gets into replenishment")
+                # station.add_robot(self.robotName())
+                # self.setPath(self.transform_coords_to_list(station.get_robot_route(self.robotName())))
+                # """
                 station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
-                if station.is_replenishment_station():
-                    print(f"Gets into replenishment")
                 station.add_robot(self.robotName())
                 self.setPath(self.transform_coords_to_list(station.get_robot_route(self.robotName())))
+                # """
 
         self.universe.landscape.setObject(self.robotName(), self.pos_x, self.pos_y, self.velocity, self.acceleration,
                                           self.heading, self.current_state, self.load_mass)
@@ -671,8 +798,11 @@ class Robot(Object):
 
     def move(self):
         self.changeColorByState()
-
-        self.movementPlan()
+        try:
+            self.movementPlan()
+        except Exception as e:
+            print(f"Error in robot {self.id} with robotjob {self.job}")
+            raise e
 
         self.latest_tick += 1
 
@@ -698,6 +828,20 @@ class Robot(Object):
         if self.acceleration != 0:
             self.velocity += (self.acceleration * self.universe.tick_to_second)
             self.velocity = max(0, min(self.maximum_speed, self.velocity))
+
+        if ACTIVATE_NEAREST:
+            if self.current_state in ['delivering_pod', 'station_processing', 'returning_pod']:
+                self.job.pod.pos_x = self.pos_x
+                self.job.pod.pos_y = self.pos_y
+                self.job.pod.velocity = self.velocity
+                self.job.pod.acceleration = self.acceleration
+
+                pod_id = self.job.pod.pod_id
+
+                self.warehouse.pod_manager.get_pod_by_id(pod_id).pos_x = self.pos_x
+                self.warehouse.pod_manager.get_pod_by_id(pod_id).pos_y = self.pos_y
+                self.warehouse.pod_manager.get_pod_by_id(pod_id).velocity = self.velocity
+                self.warehouse.pod_manager.get_pod_by_id(pod_id).acceleration = self.acceleration
 
         # for traffic policy purposes, report states to the manager
         self.universe.landscape.setObject(self.robotName(), self.pos_x, self.pos_y, self.velocity, self.acceleration,
@@ -781,12 +925,58 @@ class Robot(Object):
         self.job = job
         self.current_state = "taking_pod"
         self.route_stop_points = None
+        # print("called from assign_jobn_and_set_move_to_station")
         self.advance_state_if_needed()
         self.taking_pod_delay = 0
 
     def set_move_to_take_pod(self):
-        self.set_move(self.job.pod_coordinate, graph=self.universe.graph, need_neutralize_robot=False)
+        # self.set_move(self.job.pod_coordinate, graph=self.universe.graph, need_neutralize_robot=False)
+        # self.current_state = "taking_pod"
+        pod_id = self.job.pod.pod_id
+        x = self.warehouse.pod_manager.get_pod_by_id(pod_id).pos_x
+        y = self.warehouse.pod_manager.get_pod_by_id(pod_id).pos_y
+        self.w1 = NetLogoCoordinate(x, y)
+        self.destination = NetLogoCoordinate(x, y)
+
+        # self.w1 = NetLogoCoordinate(self.job.pod.pos_x, self.job.pod.pos_y)
+        # self.destination = NetLogoCoordinate(self.job.pod.pos_x, self.job.pod.pos_y)
+        print(f"[DEBUG] destination: {self.destination}")
+
+        if self.close_enough(self.destination):
+            # self.job.pod.pos_x = self.pos_x
+            # self.job.pod.pos_y = self.pos_y
+            # self.job.pod.velocity = 0
+            # self.job.pod.acceleration = 0
+            self.warehouse.pod_manager.get_pod_by_id(pod_id).pos_x = self.pos_x
+            self.warehouse.pod_manager.get_pod_by_id(pod_id).pos_y = self.pos_y
+            self.warehouse.pod_manager.get_pod_by_id(pod_id).velocity = 0
+            self.warehouse.pod_manager.get_pod_by_id(pod_id).acceleration = 0
+            self.job.pod.pos_x = self.pos_x
+            self.job.pod.pos_y = self.pos_y
+            self.job.pod.velocity = 0
+            self.job.pod.acceleration = 0
+        try:
+            self.set_move(self.destination, graph=self.warehouse.graph, need_neutralize_robot=False)
+        except Exception as e:
+            print(f"[ERROR] move pod {self.job.pod.pod_id} location {(self.job.pod.pos_x, self.job.pod.pos_y)} destination {self.destination}")
+            print(f"[ERROR] current robot {self.robotID} job {self.job.job_id}")
+            print(f"[ERROR] other ongoing robots")
+            for o in self.warehouse.get_movable_objects():
+                if isinstance(o, Robot):
+                    print(f" >>> robot {o.robotID} job {o.job.job_id} pod {o.job.pod.pod_id}")
+                    if o.job.pod.pod_id == self.job.pod.pod_id:
+                        print("[CRITICAL] double job for this pod")
+            raise e
         self.current_state = "taking_pod"
+        upsert_pod_travel(
+            self.job.my_id,
+            self.robotID(self.robotName()),
+            str(self.job.pod.pod_id),
+            "taking_pod",
+            str((self.pos_x, self.pos_y)),
+            str((self.job.pod.pos_x, self.job.pod.pos_y)),
+            self.universe._tick
+        )
 
     def set_move_to_station_gate(self):
         station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
@@ -795,7 +985,7 @@ class Robot(Object):
     def set_move(self, dest: NetLogoCoordinate, graph, need_neutralize_robot: bool = False, avoid_side: bool = False):
         start = self.coordinate_to_string_key(round(self.pos_x), round(self.pos_y))
         end = self.coordinate_to_string_key(dest.x, dest.y)
-
+        # print(f"[DEBUG] set move start: {start} end: {end}")
         if need_neutralize_robot:
             self.neutralizeRobotState()
 
@@ -811,12 +1001,17 @@ class Robot(Object):
 
         node_routes = None
         if self.universe.zoning:
+            # print(f"[DEBUG] universe.zoning == True")
             zone_boundary, penalties = self.create_zone(method="kmeans")
             node_routes = graph.dijkstra_modified(start,end, penalties, zone_boundary, nodes_to_avoid)
         else:
+            # print(f"[DEBUG] universe.zoning == False")
             node_routes = graph.dijkstra(start, end, nodes_to_avoid) # This one is baseline
-        
-        self.setPath(self._transformRouteToList(node_routes))
+        try:
+            self.setPath(self._transformRouteToList(node_routes))
+        except Exception as e:
+            print(f"[ERROR] failed to setPath from {start} to {end} with route {node_routes}")
+            raise e
 
     def create_zone(self, method):
         robot_objects = self.universe.landscape.get_robot_object()
@@ -891,18 +1086,6 @@ class Robot(Object):
         return int(robot_name.split('-')[1])
 
     @staticmethod
-    def calculate_all_directions_next_blocks(x, y, block_count=5, include_self=False):
-        headings = [0, 90, 180, 270]
-        result = []
-
-        for heading in headings:
-            blocks = Robot._calculate_next_blocks(x, y, heading, block_count, include_self)
-            for block in blocks:
-                result.append(block)
-
-        return result
-
-    @staticmethod
     def _calculate_next_blocks(x, y, heading, block_count=5, include_self=False):
         x_difference = 0
         y_difference = 0
@@ -937,3 +1120,7 @@ class Robot(Object):
         for p in blocks_1:
             if p in blocks_2:
                 return p
+
+
+def calculateManhattanDistance(u, v):
+    return abs(u[0] - v[0]) + abs(u[1] - v[1])

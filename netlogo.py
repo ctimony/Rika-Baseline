@@ -5,7 +5,6 @@ import traceback
 from typing import List
 import random
 import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import networkx as nx
 import pandas as pd
@@ -27,8 +26,17 @@ from model.robot import Robot
 from model.station import Station
 from model.layout import Layout
 from model.pod_generator import PodGenerator
+# DB
+from model.tools.pod_location import clear_pod_locations, initialize_pod_location_table, upsert_pod_location
+from model.tools.pod_travel import clear_pod_travel, initialize_pod_travel_table
+from model.tools.job_task import clear_job_task_table, initialize_job_task_table
+from model.tools.order_history import clear_order_history, initialize_order_history_table
 
 from pip._internal import main as pipmain
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+ACTIVATE_NEAREST = True
 
 
 class DirectedGraph:
@@ -222,7 +230,7 @@ def initRobots(universe: Inventory):
     # Iterate through each robot in the list to initialize and add to the universe
     for r in robots:
         # Create a new Robot instance
-        robot = Robot()
+        robot = Robot(universe)
 
         # Set the robot's attributes based on the dictionary values
         robot.velocity = r['velocity']
@@ -255,25 +263,33 @@ def draw_layout_from_generated_file(universe: Inventory):
     # Config Orders
     assign_skus_to_pods(universe.pod_manager)
     config_orders(
-        initial_order=20,
+        initial_order=100,
         total_requested_item=500,  # Number of SKU in warehouse
-        items_orders_class_configuration={"A": 0.6, "B": 0.3, "C": 0.1},  # Item class configuration in warehouse
+        # total_requested_item=1000,
+        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2}, # data 13
+        # items_orders_class_configuration={"A": 0.6, "B": 0.2, "C": 0.2}, # data 10 , 11 , 12
+        # items_orders_class_configuration={"A": 0.7, "B": 0.2, "C": 0.1},  # data 1 - 8 Item class configuration in warehouse
+        # items_orders_class_configuration={"A": 0.3, "B": 0.3, "C": 0.5}, # original
         quantity_range=[1, 12],  # Quantity range of number of SKU in each order
-        order_cycle_time=120,  # Number of order per hour
-        order_period_time=2,  # the total hours
-        order_start_arrival_time=5,  # Start time of order arrival
+        order_cycle_time=300,  # Number of order per hour #previous data 1 - 12 use 500 
+        order_period_time=9,  # the total hours
+        order_start_arrival_time=0,  # Start time of order arrival
         date=1,
         sim_ver=1,
         dev_mode=False)
     # Config Backlog Orders
     config_orders(
-        initial_order=50,  # Initial order in backlog
+        initial_order=100,  # Initial order in backlog
         total_requested_item=500,  # Number of SKU in warehouse
-        items_orders_class_configuration={"A": 0.6, "B": 0.3, "C": 0.1},  # Item class configuration in warehouse
+        # total_requested_item=1000,
+        # items_orders_class_configuration={"A": 0.7, "B": 0.2, "C": 0.1},  # data 1 -8 # Item class configuration in warehouse
+        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2}, # data 13
+        # items_orders_class_configuration={"A": 0.6, "B": 0.2, "C": 0.2}, #data 10 , 11 , 12
+        # items_orders_class_configuration={"A": 0.3, "B": 0.3, "C": 0.5}, # original
         quantity_range=[1, 12],  # Quantity range of number of SKU in each order
-        order_cycle_time=120,  # Number of order per hour
-        order_period_time=3,
-        order_start_arrival_time=5,
+        order_cycle_time=300,  # Number of order per hour
+        order_period_time=9,
+        order_start_arrival_time=0,
         date=1,
         sim_ver=2,
         dev_mode=True)
@@ -481,13 +497,20 @@ def draw_storage_from_generated_file(universe: Inventory):
 
                 if value == 0:
                     obj.shape = 'empty-space'
+                    if ACTIVATE_NEAREST:
+                        universe.storage_manager.createStorage(x, y)
                 elif value == 1:
                     obj = Pod(pod_counter)
+                    if ACTIVATE_NEAREST:
+                        storage = universe.storage_manager.createStorage(x, y)
                     pod_counter += 1
-                    obj.coordinate = NetLogoCoordinate(x, y)
+                    # obj.coordinate = NetLogoCoordinate(x, y)
                     obj.pos_x = x
                     obj.pos_y = y
-
+                    upsert_pod_location(obj.pod_id, obj.pos_x, obj.pos_y)
+                    
+                    if ACTIVATE_NEAREST:
+                        universe.storage_manager.addPodToStorage(obj, storage)
                     graph_pod.add_node(obj_key)
                     universe.pod_manager.add_pod(obj)
                 elif value == 2:
@@ -742,10 +765,18 @@ def assign_skus_to_pods(pod_manager):
         # Fungsi generate pods.csv
         # PodGenerator(pod_manager).generate()
         PodGenerator(pod_types=[0], pod_num=[420], total_sku=500,
+                    #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65}, 
                       items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
-                      items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
-                      items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
-                      items_pods_class_conf={"A": 0.6, "B": 0.3, "C": 0.1},
+                      items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6}, #intial inventory , how much of each class's total inventory should be place in pods
+                      items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5}, #replenishment threshold
+                      items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2}, 
+                    #   items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6}, #original
+                    #   items_pods_class_conf={"A": 0.6, "B": 0.3, "C": 0.1}, #original 
+                    #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1}, #data 1 - 8 used this config
+                    #   items_pods_class_conf={"A": 0.4, "B": 0.4, "C": 0.2}, # data 10 
+                    #   items_pods_class_conf={"A": 0.5, "B": 0.3, "C": 0.2}, # data 11 
+                    #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1}, # data 12 
+               
                       pod_manager=pod_manager,
                       dev_mode=False).generate()
         assign_skus_to_pods_from_file(pod_manager)
@@ -795,6 +826,20 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
 
 def setup():
     try:
+        # Initiate DB
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+
+        initialize_job_task_table(timestamp)
+        initialize_order_history_table(timestamp)
+        initialize_pod_location_table(timestamp)
+        initialize_pod_travel_table(timestamp)
+
+        clear_job_task_table()
+        clear_order_history()
+        clear_pod_locations()
+        clear_pod_travel()
         # Initialize the simulation universe
         assignment_path = "assign_order.csv"
         if os.path.exists(assignment_path):
@@ -839,8 +884,38 @@ def tick():
 
         # Perform a simulation tick
         next_result = universe.tick()
-        if universe._tick > 1000:
+        if universe._tick > 28800:
             return IndexError
+
+        # Save updated state
+        with open('netlogo.state', 'wb') as config_dictionary_file:
+            pickle.dump(universe, config_dictionary_file)
+
+        # Return all required information for NetLogo
+        # next_result[0] contains object positions
+        # next_result[1] contains station orders
+        return [next_result[0], universe.total_energy, len(universe.job_queue), universe.stop_and_go,
+                universe.total_turning, next_result[1]]
+
+    except Exception as e:
+        # Print complete stack trace
+        traceback.print_exc()
+        return "An error occurred. See the details above."
+    
+def console_tick():
+    try:
+        # Load the simulation state
+        with open('netlogo.state', 'rb') as file:
+            universe: Inventory = pickle.load(file)
+
+        # Update each object with the current universe context
+        for _n in universe._objects:
+            _n.setUniverse(universe)
+        while True:
+            # Perform a simulation tick
+            next_result = universe.tick()
+            if universe._tick > 28800:
+                return IndexError
 
         # Save updated state
         with open('netlogo.state', 'wb') as config_dictionary_file:

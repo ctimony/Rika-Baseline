@@ -28,6 +28,9 @@ class Universe:
         return self._objects
     
     def generateResult(self):
+        # print("\n\ngenerateResult is called\n\n")
+        # print("moveable objects")
+        # print(len(self.get_movable_objects()))
         result = []
         for o in self.get_movable_objects():
             result.append({

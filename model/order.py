@@ -40,6 +40,24 @@ class Order:
             if details['total_quantity'] > (details['quantity_delivered'] + details['quantity_committed'])
         }
         return remaining_skus
+    
+    def get_unpicked_skus(self):
+        """Mengembalikan nomor SKU dan jumlah yang belum dipindah ke bin"""
+        unpicked_skus = {
+            sku: details['total_quantity'] - details['quantity_delivered']
+            for sku, details in self.skus.items()
+            if details['total_quantity'] - details['quantity_delivered'] != 0
+        }
+        return unpicked_skus
+    
+    def get_picked_skus(self):
+        """yang sudah di deliver"""
+        picked_skus = {
+            sku: details['quantity_delivered']
+            for sku, details in self.skus.items()
+            if details['quantity_delivered'] != 0
+        }
+        return picked_skus
 
     def start_processing(self, start_time):
         """Record the start time for order processing."""

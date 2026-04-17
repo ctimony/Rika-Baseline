@@ -87,9 +87,10 @@ def check_items_pods_feasibility(total_sku, pod_types, pods_dictionary):
 
 def gen_items(pod_types=[0], 
               total_sku=500, 
-              items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6}, 
+            #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65}, 
+              items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
               items_pods_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5}, 
-              items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
+              items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
               select_option=1, 
               dev_mode=False):
 
@@ -539,11 +540,13 @@ def assign_items_to_pods(pods, items, items_pods_class_conf, dev_mode=False):
     
     return pods
                             
-def config_items_pods(pod_types=[0], pod_num=[420], total_sku=500, 
+def config_items_pods(pod_types=[0], pod_num=[420], total_sku=1000, 
+                    #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65},
                       items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
-                      items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
-                      items_pods_class_conf={"A": 0.6, "B": 0.3, "C": 0.1},
+                      items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
+                    #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1},
+                      items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2}, # chat gpt data 13
                       dev_mode=False):
     
     working_path = get_working_path(dev_mode)
@@ -659,12 +662,12 @@ if __name__ == "__main__":
     
     dev_mode=True
     pod_types = [0]
-    pod_num = [420]
-    total_sku = 500
-    items_class_conf = {"A": 0.1, "B": 0.3, "C": 0.6}
+    pod_num = [460]
+    total_sku = 1000
+    items_class_conf = {"A": 0.07, "B": 0.28, "C": 0.65}
     items_pod_inventory_levels = {"A": 0.4, "B": 0.5, "C": 0.6}
-    items_warehouse_inventory_levels = {"A": 0.4, "B": 0.5, "C": 0.6}
-    items_pods_class_conf = {"A": 0.6, "B": 0.3, "C": 0.1}
+    items_warehouse_inventory_levels = {"A": 0.3, "B": 0.4, "C": 0.5}
+    items_pods_class_conf = {"A": 0.3, "B": 0.3, "C": 0.4}
 
     working_path = get_working_path(dev_mode)    
     generated_database_order_path = os.path.join(parent_directory, 'generated_database_order.csv')

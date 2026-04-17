@@ -235,7 +235,7 @@ total_turning
 MONITOR
 970
 196
-1200
+1265
 253
 Station 1 Orders
 station1_orders
@@ -246,7 +246,7 @@ station1_orders
 MONITOR
 970
 273
-1200
+1265
 330
 Station 2 Orders
 station2_orders
@@ -257,7 +257,7 @@ station2_orders
 MONITOR
 970
 348
-1200
+1265
 405
 Station 3 Orders
 station3_orders

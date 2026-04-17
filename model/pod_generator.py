@@ -76,9 +76,10 @@ class PodGenerator:
     
     def gen_items(self, pod_types=[0], 
               total_sku=500, 
-              items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6}, 
+            #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65}, 
+              items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
               items_pods_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5}, 
-              items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
+              items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
               select_option=1, 
               dev_mode=False):
         
@@ -408,10 +409,12 @@ class PodGenerator:
         return pods
     
     def config_items_pods(self,pod_types=[0], pod_num=[420], total_sku=500, 
+                    #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65},
                       items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
-                      items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
-                      items_pods_class_conf={"A": 0.6, "B": 0.3, "C": 0.1},
+                      items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
+                    #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1}, # original
+                      items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2}, # chat gpt data 13
                       dev_mode=False):
         
         working_path = self.get_working_path(dev_mode)

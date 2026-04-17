@@ -6,13 +6,17 @@ class Pod(Object):
     def __init__(self, pod_id: int):
         self.pod_id = pod_id
         self.shape = 'full square'
+        # self.shape = 'circle'
         self.object_type = 'pod'
-        self.coordinate = NetLogoCoordinate()
+        # self.coordinate = NetLogoCoordinate()
         self.skus = {}
         self.is_idle = True
         self.station = None
         self.need_replenishment = False
         self.mass = 0
+        self.velocity = 0
+        self.acceleration = 0
+
         super().__init__()
 
     def __eq__(self, other):
@@ -21,10 +25,15 @@ class Pod(Object):
         return False
 
     def __hash__(self):
-        return hash(self.pod_id)
+        # return hash(self.pod_id)
+        return hash(getattr(self, "pod_id", id(self)))
 
     def __repr__(self):
         return f"Pod({self.pod_id})"
+
+    @property
+    def coordinate(self):
+        return NetLogoCoordinate(self.pos_x, self.pos_y)
 
     def add_sku(self, sku, limit_qty, current_qty, threshold, weight):
         """Add a new SKU with its limit, current quantity, and threshold."""
@@ -76,5 +85,5 @@ class Pod(Object):
         self.station = None
         return
 
-    def get_skus_in_pod(self):
+    def get_skus_in_pod(self) -> dict:
         return self.skus

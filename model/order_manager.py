@@ -9,6 +9,7 @@ class OrderManager:
         self.order_id_to_order: Dict[int, Order] = {}
         # self.finished_orders: List[Order] = []
         self.unfinished_orders: List[Order] = []
+        self.preassign_order_ids: List[int] = []
 
     def add_order(self, order: Order):
         self.orders.append(order)

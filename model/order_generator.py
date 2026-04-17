@@ -87,7 +87,10 @@ def gen_backlog(initial_order, total_requested_item, items_orders_class_configur
         # print(keys, thresholds)
 
         orders_in_backlog = list(i * -1 for i in range(1, initial_order+1))
-        items_in_order = np.random.geometric(p=0.3, size=initial_order)
+        items_in_order = np.random.geometric(p=0.5, size=initial_order) # data 1 -8 
+        # items_in_order = np.random.geometric(p=0.3, size=initial_order) # data 9 - 11
+        # items_in_order = np.random.geometric(p=0.4, size=initial_order) # data 12
+        # items_in_order = np.random.geometric(p=0.2, size=initial_order) # data 13
         # print(orders_in_backlog, items_in_order)
 
         orders_backlog = pd.DataFrame(columns=[ 'order_id', 
@@ -235,7 +238,10 @@ def gen_order(order_cycle_time,
 
         arrival_times_list = [60 * x for x in arrival_times_list] # convert to seconds
         orders = range(0, len(arrival_times_list))
-        items_in_order = np.random.geometric(p=0.3, size=len(orders))
+        items_in_order = np.random.geometric(p=0.5, size=len(orders))
+        # items_in_order = np.random.geometric(p=0.3, size=len(orders))
+        # items_in_order = np.random.geometric(p=0.4, size=len(orders))
+        # items_in_order = np.random.geometric(p=0.2, size=len(orders)) # data 13
 
         database_order = pd.DataFrame(columns=['order_dum', 
                                                'order_type', 

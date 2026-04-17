@@ -12,8 +12,8 @@ class Layout(object):
         self.reserved_column_start = 9
         self.reserved_column_end = 9
         self.reserved_column_station = 5
-        self.order_picker_total = 3
-        self.order_replenishment_total = 2
+        self.order_picker_total = 5
+        self.order_replenishment_total = 1
         self.horizontal_direction_switch = False
         self.vertical_direction_switch = False
         self.total_pods_active = 420 # Number of pods

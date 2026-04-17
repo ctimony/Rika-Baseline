@@ -102,6 +102,7 @@ class StationManager:
         return assign_station
     
     def assign_robot_to_picking_station(self, robot_id):
+        # NOTE: no use
         station = self.find_available_picking_station()
         if station is None:
             print("No available station found.")
