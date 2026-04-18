@@ -1,13 +1,12 @@
 from datetime import datetime
 
 class Landscape:
-    dimension = 0
-    total_objects = 0
-    _map = []
-    _objects = {}
 
     def __init__(self, dimension):
         self.dimension = dimension
+        self.total_objects = 0
+        self._map = []
+        self._objects = {}
         self.current_date_string = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         for i in range(self.dimension+1):
             one_row = []

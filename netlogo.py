@@ -904,31 +904,82 @@ def tick():
     
 def console_tick():
     try:
-        # Load the simulation state
+        import datetime
         with open('netlogo.state', 'rb') as file:
             universe: Inventory = pickle.load(file)
 
-        # Update each object with the current universe context
         for _n in universe._objects:
             _n.setUniverse(universe)
+
+        tick_rows = []
         while True:
-            # Perform a simulation tick
             next_result = universe.tick()
+            tick_rows.append({
+                'tick': round(universe._tick, 4),
+                'total_energy': universe.total_energy,
+                'job_queue_len': len(universe.job_queue),
+                'stop_and_go': universe.stop_and_go,
+                'total_turning': universe.total_turning,
+            })
             if universe._tick > 28800:
-                return IndexError
+                break
 
-        # Save updated state
-        with open('netlogo.state', 'wb') as config_dictionary_file:
-            pickle.dump(universe, config_dictionary_file)
+        with open('netlogo.state', 'wb') as f:
+            pickle.dump(universe, f)
 
-        # Return all required information for NetLogo
-        # next_result[0] contains object positions
-        # next_result[1] contains station orders
+        result_dir = os.path.join('result', datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+        os.makedirs(result_dir, exist_ok=True)
+
+        tick_df = pd.DataFrame(tick_rows)
+        tick_df.to_csv(os.path.join(result_dir, 'tick_metrics.csv'), index=False)
+
+        orders_df = pd.read_csv(os.path.join('output', 'order-finished.csv'))
+        orders_df['cycle_time'] = orders_df['order_complete_time'] - orders_df['process_start_time']
+        orders_df.to_csv(os.path.join(result_dir, 'orders.csv'), index=False)
+
+        finished_orders = orders_df[orders_df['order_id'] >= 0]
+        orders_finished = finished_orders['order_id'].nunique()
+
+        max_ticks = 28800
+        gen_df = pd.read_csv('generated_order.csv')
+        orders_generated = gen_df[(gen_df['order_id'] >= 0) & (gen_df['order_arrival'] <= max_ticks)]['order_id'].nunique()
+
+        pod_info_df = pd.read_csv('pod_info.csv')
+        total_picks = len(pod_info_df[pod_info_df['task_type'] == 1])
+        total_replenishments = len(pod_info_df[pod_info_df['task_type'] == 2])
+        reple_pick_ratio = round(total_replenishments / total_picks, 4) if total_picks > 0 else 0
+
+        picks_df = pod_info_df[pod_info_df['task_type'] == 1]
+        pod_utilization = round(picks_df['qty'].sum() / picks_df[['pod_id', 'processed_time']].drop_duplicates().shape[0], 4) if not picks_df.empty else 0
+
+        summary = {
+            'max_ticks': max_ticks,
+            'ticks': round(universe._tick, 2),
+            'orders_finished': orders_finished,
+            'total_energy': universe.total_energy,
+            'stop_and_go': universe.stop_and_go,
+            'total_turning': universe.total_turning,
+            'peak_job_queue': int(tick_df['job_queue_len'].max()),
+            'avg_job_queue': round(tick_df['job_queue_len'].mean(), 2),
+            'avg_cycle_time': round(finished_orders['cycle_time'].mean(), 2) if not finished_orders.empty else 0,
+            'max_cycle_time': round(finished_orders['cycle_time'].max(), 2) if not finished_orders.empty else 0,
+            'order_throughput': round(orders_finished / orders_generated, 4) if orders_generated > 0 else 0,
+            'replenishment_pick_ratio': reple_pick_ratio,
+            'pod_utilization': pod_utilization,
+        }
+
+        print("\n===== SIMULATION RESULTS =====")
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
+        print(f"  Results saved to: {result_dir}")
+        print("==============================\n")
+
+        pd.DataFrame([summary]).to_csv(os.path.join(result_dir, 'summary.csv'), index=False)
+
         return [next_result[0], universe.total_energy, len(universe.job_queue), universe.stop_and_go,
                 universe.total_turning, next_result[1]]
 
     except Exception as e:
-        # Print complete stack trace
         traceback.print_exc()
         return "An error occurred. See the details above."
 

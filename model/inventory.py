@@ -1177,9 +1177,9 @@ class Inventory(Universe):
                     "pod_1": first_queue,
                     "pod_2": second_queue,
                     "pod_3": third_queue,
-                    "occupied_1": first_queue.job.orders if first_queue else None,
-                    "occupied_2": second_queue.job.orders if second_queue else None,
-                    "occupied_3": third_queue.job.orders if third_queue else None,
+                    "occupied_1": first_queue.job.orders if (first_queue and first_queue.job) else None,
+                    "occupied_2": second_queue.job.orders if (second_queue and second_queue.job) else None,
+                    "occupied_3": third_queue.job.orders if (third_queue and third_queue.job) else None,
                     "next_bin_avail": None,
                     "pre_assign": self.preassign_dict.get(order_id, None)
                 })
@@ -1286,9 +1286,9 @@ class Inventory(Universe):
                     "pod_1": first_queue,
                     "pod_2": second_queue,
                     "pod_3": third_queue,
-                    "occupied_1": first_queue.job.orders if first_queue else None,
-                    "occupied_2": second_queue.job.orders if second_queue else None,
-                    "occupied_3": third_queue.job.orders if third_queue else None,
+                    "occupied_1": first_queue.job.orders if (first_queue and first_queue.job) else None,
+                    "occupied_2": second_queue.job.orders if (second_queue and second_queue.job) else None,
+                    "occupied_3": third_queue.job.orders if (third_queue and third_queue.job) else None,
                     "next_bin_avail": None,
                     "pre_assign": self.preassign_dict.get(order_id, None)
                 })
@@ -1375,6 +1375,8 @@ class Inventory(Universe):
         current_picker = list(empty_bins.keys())[0]
         total_order_ids = empty_bins[current_picker]
         fulfilment_fs = self.get_fulfilment_table(mode="FS")
+        if fulfilment_fs.empty:
+            return
         advanced_df = self.get_advanced_table_only()
         while self.preassign_per_station[current_picker] and empty_bins[current_picker] > 0:
             order_ids.append(self.preassign_per_station[current_picker].popleft())
@@ -1452,8 +1454,8 @@ class Inventory(Universe):
                     # process
                     self.yyy(current_picker, order_ids)
                     return
-            print(f"")
-            raise AssertionError("WHAT???")
+            self.yyy(current_picker, order_ids)
+            return
 
     def yyy(self, station_id, order_ids):
         self.put_order_to_picking_station({station_id: order_ids})
