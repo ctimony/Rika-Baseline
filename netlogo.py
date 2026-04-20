@@ -907,15 +907,21 @@ def console_tick():
             _n.setUniverse(universe)
 
         tick_rows = []
+        prev_energy = 0
+        prev_turning = 0
+        prev_stop_and_go = 0
         while True:
             next_result = universe.tick()
             tick_rows.append({
                 'tick': round(universe._tick, 4),
-                'total_energy': universe.total_energy,
+                'energy': round(universe.total_energy - prev_energy, 6),
                 'job_queue_len': len(universe.job_queue),
-                'stop_and_go': universe.stop_and_go,
-                'total_turning': universe.total_turning,
+                'stop_and_go': universe.stop_and_go - prev_stop_and_go,
+                'turning': universe.total_turning - prev_turning,
             })
+            prev_energy = universe.total_energy
+            prev_turning = universe.total_turning
+            prev_stop_and_go = universe.stop_and_go
             if universe._tick > 28800:
                 break
 
@@ -947,26 +953,48 @@ def console_tick():
         picks_df = pod_info_df[pod_info_df['task_type'] == 1]
         pod_utilization = round(picks_df['qty'].sum() / picks_df[['pod_id', 'processed_time']].drop_duplicates().shape[0], 4) if not picks_df.empty else 0
 
+        total_units_picked = int(picks_df['qty'].sum()) if not picks_df.empty else 0
+        total_pod_visits = picks_df[['pod_id', 'processed_time']].drop_duplicates().shape[0] if not picks_df.empty else 0
+        avg_cycle = round(finished_orders['cycle_time'].mean(), 2) if not finished_orders.empty else 0
+        max_cycle = round(finished_orders['cycle_time'].max(), 2) if not finished_orders.empty else 0
+        peak_jq = int(tick_df['job_queue_len'].max())
+        avg_jq = round(tick_df['job_queue_len'].mean(), 2)
+        throughput = round(orders_finished / orders_generated, 4) if orders_generated > 0 else 0
+
         summary = {
             'max_ticks': max_ticks,
             'ticks': round(universe._tick, 2),
             'orders_finished': orders_finished,
-            'total_energy': universe.total_energy,
+            'orders_generated': orders_generated,
+            'total_energy': round(universe.total_energy, 2),
             'stop_and_go': universe.stop_and_go,
             'total_turning': universe.total_turning,
-            'peak_job_queue': int(tick_df['job_queue_len'].max()),
-            'avg_job_queue': round(tick_df['job_queue_len'].mean(), 2),
-            'avg_cycle_time': round(finished_orders['cycle_time'].mean(), 2) if not finished_orders.empty else 0,
-            'max_cycle_time': round(finished_orders['cycle_time'].max(), 2) if not finished_orders.empty else 0,
-            'order_throughput': round(orders_finished / orders_generated, 4) if orders_generated > 0 else 0,
+            'peak_job_queue': peak_jq,
+            'avg_job_queue': avg_jq,
+            'avg_cycle_time': avg_cycle,
+            'max_cycle_time': max_cycle,
+            'order_throughput': throughput,
+            'total_replenishments': total_replenishments,
+            'total_picks': total_picks,
             'replenishment_pick_ratio': reple_pick_ratio,
+            'total_units_picked': total_units_picked,
+            'total_pod_visits': total_pod_visits,
             'pod_utilization': pod_utilization,
         }
 
         print("\n===== SIMULATION RESULTS =====")
-        for k, v in summary.items():
-            print(f"  {k}: {v}")
-        print(f"  Results saved to: {result_dir}")
+        print(f"  Orders finished:   {orders_finished}")
+        print(f"  Total energy:      {summary['total_energy']}")
+        print(f"  Stop & go:         {universe.stop_and_go}")
+        print(f"  Total turning:     {universe.total_turning}")
+        print(f"  Peak job queue:    {peak_jq}")
+        print(f"  Avg job queue:     {avg_jq}")
+        print(f"  Avg cycle time:    {avg_cycle}s")
+        print(f"  Max cycle time:    {max_cycle}s")
+        print(f"  Order throughput:  {throughput} ({orders_generated} generated)")
+        print(f"  Replen/pick ratio: {reple_pick_ratio} ({total_replenishments}R / {total_picks}P)")
+        print(f"  Pod utilization:   {pod_utilization} ({total_units_picked} units / {total_pod_visits} visits)")
+        print(f"  Results saved to:  {result_dir}")
         print("==============================\n")
 
         pd.DataFrame([summary]).to_csv(os.path.join(result_dir, 'summary.csv'), index=False)

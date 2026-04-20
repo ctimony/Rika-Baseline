@@ -57,7 +57,7 @@ class Inventory(Universe):
         self._tick = 0  #current counter
         # self.ignored_types = ["pod", "station", "way-direction"]
         self.ignored_types = ["station", "way-direction"]
-        self.tick_to_second = 0.25
+        self.tick_to_second = 0.15
         self.job_queue: list[RobotJob] = []
         self.landscape = Landscape(self.dimension)
         self.pod_manager = PodManager()
