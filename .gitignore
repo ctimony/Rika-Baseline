@@ -6,3 +6,6 @@
 /.idea/vcs.xml
 /.idea/.gitignore
 netlogo.state
+profile.prof
+warehouse.db
+netlogo_profile_summary.txt
