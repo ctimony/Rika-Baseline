@@ -32,7 +32,7 @@ class PodManager:
             self.sku_to_pods[sku] = []
         self.sku_to_pods[sku].append(pod)
 
-    def add_sku_data(self,sku,current_qty,max_qty,global_threshold_inv_level):
+    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0):
         sku_id = sku
 
         if sku_id not in self.skus_data:
@@ -40,7 +40,8 @@ class PodManager:
                 'current_global_qty': current_qty,
                 'max_global_qty': max_qty,
                 'global_inv_level': (current_qty / max_qty),
-                'global_threshold_inv_level' : global_threshold_inv_level
+                'global_threshold_inv_level': global_threshold_inv_level,
+                'rop_global': rop_global,
             }
         else:
             self.skus_data[sku_id]['current_global_qty'] += current_qty
@@ -56,8 +57,8 @@ class PodManager:
         return self.skus_data
     
     def is_sku_need_replenished(self, sku_id):
-        print(f"sku_id {sku_id} level {self.skus_data[sku_id]['global_inv_level']}")
-        if float(self.skus_data[sku_id]['global_inv_level']) <= float(self.skus_data[sku_id]['global_threshold_inv_level']):
+        print(f"sku_id {sku_id} level {self.skus_data[sku_id]['current_global_qty']} rop {self.skus_data[sku_id]['rop_global']}")
+        if self.skus_data[sku_id]['current_global_qty'] <= self.skus_data[sku_id]['rop_global']:
             return sku_id, True
         else:
             return sku_id, False

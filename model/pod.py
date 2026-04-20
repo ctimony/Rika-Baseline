@@ -35,13 +35,14 @@ class Pod(Object):
     def coordinate(self):
         return NetLogoCoordinate(self.pos_x, self.pos_y)
 
-    def add_sku(self, sku, limit_qty, current_qty, threshold, weight):
+    def add_sku(self, sku, limit_qty, current_qty, threshold, weight, rop_per_pod=0):
         """Add a new SKU with its limit, current quantity, and threshold."""
         self.skus[sku] = {
             'limit_qty': limit_qty,
             'current_qty': current_qty,
             'threshold': threshold,
             'weight': weight,
+            'rop_per_pod': rop_per_pod,
         }
         self.mass += (self.skus[sku]['weight'] * self.skus[sku]['current_qty'])
 
@@ -53,7 +54,7 @@ class Pod(Object):
         alpha = total_skus / 2
         for details in self.skus.values():
             # print(f"crt {details['current_qty']} limit {details['limit_qty']} th {details['threshold']}")
-            if float(details['current_qty'])/float(details['limit_qty']) <= float(details['threshold']):
+            if details['current_qty'] <= details['rop_per_pod']:
                 count_below_threshold += 1
 
         if count_below_threshold >= alpha:

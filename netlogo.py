@@ -769,6 +769,10 @@ def assign_skus_to_pods(pod_manager):
 
 
 def assign_skus_to_pods_from_file(pod_manager: PodManager):
+    import pandas as _pd
+    rop_df = _pd.read_csv('rop_summary.csv')
+    rop_dict = dict(zip(rop_df['item_id'].astype(int),
+                        zip(rop_df['rop_global'].astype(int), rop_df['rop_per_pod'].astype(int))))
 
     with open('pods.csv', mode='r', newline='') as file:
         reader = csv.DictReader(file)
@@ -783,13 +787,16 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
             global_threshold_inv_level = row['item_warehouse_inventory_level']
             weight = float(row['item_weight'])
 
+            rop_global_val, rop_per_pod_val = rop_dict.get(sku, (1, 1))
+
             # Find the pod by id
             pod: Pod = pod_manager.get_pod_by_id(pod_id)
-            pod.add_sku(sku, limit_qty=limit_qty, current_qty=current_qty, threshold=threshold, weight=weight)
+            pod.add_sku(sku, limit_qty=limit_qty, current_qty=current_qty, threshold=threshold,
+                        weight=weight, rop_per_pod=rop_per_pod_val)
             pod_manager.add_sku_to_pod(sku, pod)
 
             # Add SKU Data of level
-            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level)
+            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val)
 
     csv_file = 'skus_data.csv'
     if os.path.exists(csv_file):
