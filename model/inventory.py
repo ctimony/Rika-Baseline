@@ -38,6 +38,8 @@ pd.set_option('display.max_colwidth', None)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)  # Let it auto-expand
 
+POD_WMAX = 600.0  # kg — max pod load weight
+
 class Inventory(Universe):
     dimension = 60
     map = []
@@ -305,7 +307,7 @@ class Inventory(Universe):
     def finish_replenishment_task(self, job: RobotJob):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
-        pod.replenish_all_skus()
+        pod.replenish_all_skus_capped(POD_WMAX)
         pod_info_df = pd.read_csv('pod_info.csv')
         new_row = {
                 "pod_id": pod.pod_id,
@@ -1172,7 +1174,7 @@ class Inventory(Universe):
                 df_dicts.append({
                     "station_id": station_id,
                     "order_id": order_id,
-                    "unpicked_skus": str(unpicked_skus),
+                    "unpicked_skus": str({int(k): v for k, v in unpicked_skus.items()}),
                     # "robot_inside_station": self.robot_queue_order[station_id],
                     "pod_1": first_queue,
                     "pod_2": second_queue,
@@ -1281,7 +1283,7 @@ class Inventory(Universe):
                 df_dicts.append({
                     "station_id": station_id,
                     "order_id": order_id,
-                    "unpicked_skus": str(unpicked_skus),
+                    "unpicked_skus": str({int(k): v for k, v in unpicked_skus.items()}),
                     # "robot_inside_station": self.robot_queue_order[station_id],
                     "pod_1": first_queue,
                     "pod_2": second_queue,
@@ -1318,7 +1320,16 @@ class Inventory(Universe):
                 if available[sku] < req_qty:
                     return False
             return True
-        df['unpicked_skus'] = df['unpicked_skus'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+        def safe_parse(x):
+            if not isinstance(x, str):
+                return x
+            try:
+                return ast.literal_eval(x)
+            except Exception:
+                import re
+                cleaned = re.sub(r'np\.int64\((\d+)\)', r'\1', x)
+                return ast.literal_eval(cleaned)
+        df['unpicked_skus'] = df['unpicked_skus'].apply(safe_parse)
         df['next_bin_avail'] = df.apply(is_fulfilled, axis=1)
         return df
     

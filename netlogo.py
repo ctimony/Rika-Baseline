@@ -37,6 +37,7 @@ from pip._internal import main as pipmain
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 ACTIVATE_NEAREST = True
+POD_WMAX = 600  # kg — max pod load weight (item weight only, no frame weight in current model)
 
 
 class DirectedGraph:
@@ -264,14 +265,10 @@ def draw_layout_from_generated_file(universe: Inventory):
     assign_skus_to_pods(universe.pod_manager)
     config_orders(
         initial_order=100,
-        total_requested_item=500,  # Number of SKU in warehouse
-        # total_requested_item=1000,
-        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2}, # data 13
-        # items_orders_class_configuration={"A": 0.6, "B": 0.2, "C": 0.2}, # data 10 , 11 , 12
-        # items_orders_class_configuration={"A": 0.7, "B": 0.2, "C": 0.1},  # data 1 - 8 Item class configuration in warehouse
-        # items_orders_class_configuration={"A": 0.3, "B": 0.3, "C": 0.5}, # original
+        total_requested_item=4400,  # Number of SKU in warehouse
+        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2},
         quantity_range=[1, 12],  # Quantity range of number of SKU in each order
-        order_cycle_time=300,  # Number of order per hour #previous data 1 - 12 use 500 
+        order_cycle_time=300,  # Number of order per hour
         order_period_time=9,  # the total hours
         order_start_arrival_time=0,  # Start time of order arrival
         date=1,
@@ -280,12 +277,8 @@ def draw_layout_from_generated_file(universe: Inventory):
     # Config Backlog Orders
     config_orders(
         initial_order=100,  # Initial order in backlog
-        total_requested_item=500,  # Number of SKU in warehouse
-        # total_requested_item=1000,
-        # items_orders_class_configuration={"A": 0.7, "B": 0.2, "C": 0.1},  # data 1 -8 # Item class configuration in warehouse
-        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2}, # data 13
-        # items_orders_class_configuration={"A": 0.6, "B": 0.2, "C": 0.2}, #data 10 , 11 , 12
-        # items_orders_class_configuration={"A": 0.3, "B": 0.3, "C": 0.5}, # original
+        total_requested_item=4400,  # Number of SKU in warehouse
+        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2},
         quantity_range=[1, 12],  # Quantity range of number of SKU in each order
         order_cycle_time=300,  # Number of order per hour
         order_period_time=9,
@@ -764,20 +757,13 @@ def assign_skus_to_pods(pod_manager):
     else:
         # Fungsi generate pods.csv
         # PodGenerator(pod_manager).generate()
-        PodGenerator(pod_types=[0], pod_num=[420], total_sku=500,
-                    #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65}, 
-                      items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
-                      items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6}, #intial inventory , how much of each class's total inventory should be place in pods
-                      items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5}, #replenishment threshold
-                      items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2}, 
-                    #   items_warehouse_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6}, #original
-                    #   items_pods_class_conf={"A": 0.6, "B": 0.3, "C": 0.1}, #original 
-                    #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1}, #data 1 - 8 used this config
-                    #   items_pods_class_conf={"A": 0.4, "B": 0.4, "C": 0.2}, # data 10 
-                    #   items_pods_class_conf={"A": 0.5, "B": 0.3, "C": 0.2}, # data 11 
-                    #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1}, # data 12 
-               
+        PodGenerator(pod_types=[3], pod_num=[467], total_sku=4400,
+                      items_class_conf={"A": 0.05228, "B": 0.12773, "C": 0.82},
+                      items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
+                      items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
+                      items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2},
                       pod_manager=pod_manager,
+                      pod_wmax=POD_WMAX,
                       dev_mode=False).generate()
         assign_skus_to_pods_from_file(pod_manager)
 
@@ -787,6 +773,8 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
     with open('pods.csv', mode='r', newline='') as file:
         reader = csv.DictReader(file)
         for row in reader:
+            if int(row['max_qty']) == 0:
+                continue
             pod_id = int(row['pod_id'])
             sku = int(row['item'])
             limit_qty = int(row['max_qty'])

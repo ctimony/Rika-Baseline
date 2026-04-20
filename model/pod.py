@@ -64,6 +64,22 @@ class Pod(Object):
         """Replenish all SKUs by setting each SKU's current quantity to its limit quantity."""
         for sku in self.skus:
             self.skus[sku]['current_qty'] = self.skus[sku]['limit_qty']
+        self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
+
+    def replenish_all_skus_capped(self, wmax: float):
+        """Replenish SKUs up to limit_qty but stop if cumulative pod mass would exceed wmax."""
+        remaining_capacity = wmax - self.mass
+        for sku in sorted(self.skus, key=lambda s: self.skus[s]['weight'], reverse=True):
+            d = self.skus[sku]
+            needed = d['limit_qty'] - d['current_qty']
+            if needed <= 0:
+                continue
+            addable = int(min(needed, remaining_capacity // d['weight'])) if d['weight'] > 0 else needed
+            d['current_qty'] += addable
+            remaining_capacity -= addable * d['weight']
+            if remaining_capacity <= 0:
+                break
+        self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
 
     def pick_sku(self, sku, qty):
         self.skus[sku]['current_qty'] -= qty
