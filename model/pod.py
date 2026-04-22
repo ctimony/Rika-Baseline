@@ -35,7 +35,7 @@ class Pod(Object):
     def coordinate(self):
         return NetLogoCoordinate(self.pos_x, self.pos_y)
 
-    def add_sku(self, sku, limit_qty, current_qty, threshold, weight, rop_per_pod=0):
+    def add_sku(self, sku, limit_qty, current_qty, threshold, weight, rop_per_pod=0, pod_inv_threshold=0.5):
         """Add a new SKU with its limit, current quantity, and threshold."""
         self.skus[sku] = {
             'limit_qty': limit_qty,
@@ -43,17 +43,18 @@ class Pod(Object):
             'threshold': threshold,
             'weight': weight,
             'rop_per_pod': rop_per_pod,
+            'pod_inv_threshold': pod_inv_threshold,
         }
         self.mass += (self.skus[sku]['weight'] * self.skus[sku]['current_qty'])
 
-    def check_replenishment_needed(self, rop_multiplier=1.0):
-        """Check if 50% or more SKUs are below their threshold to determine if the pod needs to move to a
-        replenishment station."""
+    def check_replenishment_needed(self):
+        """Check if 50% or more SKUs are below their inventory ratio threshold."""
         count_below_threshold = 0
         total_skus = len(self.skus)
         alpha = total_skus / 2
         for details in self.skus.values():
-            if details['current_qty'] <= details['rop_per_pod'] * rop_multiplier:
+            inv_level = details['current_qty'] / details['limit_qty'] if details['limit_qty'] > 0 else 0
+            if inv_level < details['pod_inv_threshold']:
                 count_below_threshold += 1
 
         if count_below_threshold >= alpha:
