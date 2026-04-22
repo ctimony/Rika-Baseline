@@ -308,8 +308,7 @@ class PodGenerator:
                             # print("    pod_id:", pod_id)
                             # print("    slot_available:", slot_available, len(slot_available))
                             if len(slot_available) == 0:
-                                print("      All slot is unavailable in pod_id", pod_id)
-                                break
+                                continue
                             else:
                                 slot_id = np.random.choice(slot_available)
                                 slot_type = pod.loc[pod["slot_id"] == slot_id, "slot_type"].values[0] 
