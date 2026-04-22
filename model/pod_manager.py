@@ -56,9 +56,9 @@ class PodManager:
     def get_all_skus_data(self):
         return self.skus_data
     
-    def is_sku_need_replenished(self, sku_id):
-        print(f"sku_id {sku_id} level {self.skus_data[sku_id]['current_global_qty']} rop {self.skus_data[sku_id]['rop_global']}")
-        if self.skus_data[sku_id]['current_global_qty'] <= self.skus_data[sku_id]['rop_global']:
+    def is_sku_need_replenished(self, sku_id, rop_multiplier=1.0):
+        effective_rop = self.skus_data[sku_id]['rop_global'] * rop_multiplier
+        if self.skus_data[sku_id]['current_global_qty'] <= effective_rop:
             return sku_id, True
         else:
             return sku_id, False

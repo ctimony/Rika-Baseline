@@ -2,6 +2,7 @@ from typing import Optional, List
 import csv
 import os
 import math
+import random
 import threading
 from collections import defaultdict, deque
 import ast
@@ -80,9 +81,9 @@ class Inventory(Universe):
         # # Start GUI in a thread
         # self.gui_thread = threading.Thread(target=start_gui, args=(self.shared_data,), daemon=True)
         # self.gui_thread.start()
-        self.poa_podmatch = False  
+        self.poa_podmatch = False
         self.poa_first = False  # preasign2 gajelas nih / F3
-        self.poa_second = True   
+        self.poa_second = True
 
         self.pps_pileon = True    
         self.pps_demand = False    
@@ -1301,6 +1302,8 @@ class Inventory(Universe):
         return df
 
     def forcast_next_bin_avail(self, df):
+        if df.empty or 'unpicked_skus' not in df.columns:
+            return df
         def is_fulfilled(row):
             required = row['unpicked_skus']
             # Flatten all occupied bins into a list
@@ -1328,6 +1331,7 @@ class Inventory(Universe):
             except Exception:
                 import re
                 cleaned = re.sub(r'np\.int64\((\d+)\)', r'\1', x)
+                cleaned = re.sub(r'np\.float64\(([\d.eE+\-]+)\)', r'\1', cleaned)
                 return ast.literal_eval(cleaned)
         df['unpicked_skus'] = df['unpicked_skus'].apply(safe_parse)
         df['next_bin_avail'] = df.apply(is_fulfilled, axis=1)
@@ -1389,6 +1393,8 @@ class Inventory(Universe):
         if fulfilment_fs.empty:
             return
         advanced_df = self.get_advanced_table_only()
+        if advanced_df.empty:
+            return
         while self.preassign_per_station[current_picker] and empty_bins[current_picker] > 0:
             order_ids.append(self.preassign_per_station[current_picker].popleft())
             empty_bins[current_picker] -= 1

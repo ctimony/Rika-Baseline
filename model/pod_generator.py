@@ -360,6 +360,10 @@ class PodGenerator:
         # make sure the qty and max_qty are integer; unassigned slots remain with item=0, qty=0
         pods[["item", "qty", "max_qty"]] = pods[["item", "qty", "max_qty"]].fillna(0).astype(int)
 
+        # cumulative pod weight after each slot assignment, ordered by slot_sequence
+        pods = pods.sort_values(["pod_id", "slot_sequence"]).reset_index(drop=True)
+        pods["cumulative_pod_weight"] = pods.groupby("pod_id")["total_item_weight"].cumsum().round(3)
+
         # save the pods to csv
         pods.to_csv(working_path + "/pods.csv", index=False)
         

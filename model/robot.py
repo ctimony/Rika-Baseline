@@ -984,7 +984,7 @@ class Robot(Object):
 
     def set_move(self, dest: NetLogoCoordinate, graph, need_neutralize_robot: bool = False, avoid_side: bool = False):
         start = self.coordinate_to_string_key(round(self.pos_x), round(self.pos_y))
-        end = self.coordinate_to_string_key(dest.x, dest.y)
+        end = self.coordinate_to_string_key(round(dest.x), round(dest.y))
         # print(f"[DEBUG] set move start: {start} end: {end}")
         if need_neutralize_robot:
             self.neutralizeRobotState()
@@ -1008,6 +1008,8 @@ class Robot(Object):
             # print(f"[DEBUG] universe.zoning == False")
             node_routes = graph.dijkstra(start, end, nodes_to_avoid) # This one is baseline
         try:
+            if node_routes is None:
+                raise ValueError(f"dijkstra returned None for route {start} → {end}")
             self.setPath(self._transformRouteToList(node_routes))
         except Exception as e:
             print(f"[ERROR] failed to setPath from {start} to {end} with route {node_routes}")

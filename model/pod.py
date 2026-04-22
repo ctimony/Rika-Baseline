@@ -46,15 +46,14 @@ class Pod(Object):
         }
         self.mass += (self.skus[sku]['weight'] * self.skus[sku]['current_qty'])
 
-    def check_replenishment_needed(self):
+    def check_replenishment_needed(self, rop_multiplier=1.0):
         """Check if 50% or more SKUs are below their threshold to determine if the pod needs to move to a
         replenishment station."""
         count_below_threshold = 0
         total_skus = len(self.skus)
         alpha = total_skus / 2
         for details in self.skus.values():
-            # print(f"crt {details['current_qty']} limit {details['limit_qty']} th {details['threshold']}")
-            if details['current_qty'] <= details['rop_per_pod']:
+            if details['current_qty'] <= details['rop_per_pod'] * rop_multiplier:
                 count_below_threshold += 1
 
         if count_below_threshold >= alpha:

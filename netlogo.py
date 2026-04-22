@@ -263,29 +263,16 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     # Config Orders
     assign_skus_to_pods(universe.pod_manager)
-    config_orders(
-        initial_order=100,
-        total_requested_item=4400,  # Number of SKU in warehouse
-        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2},
-        quantity_range=[1, 12],  # Quantity range of number of SKU in each order
-        order_cycle_time=300,  # Number of order per hour
-        order_period_time=9,  # the total hours
-        order_start_arrival_time=0,  # Start time of order arrival
+
+    from model.order_generator_tipp import gen_order_tipp
+    gen_order_tipp(
+        raw_order_path='raw_order.csv',
+        sim_duration_sec=28800,
+        start_hour=16,
+        quantity_range=[1, 12],
         date=1,
-        sim_ver=1,
-        dev_mode=False)
-    # Config Backlog Orders
-    config_orders(
-        initial_order=100,  # Initial order in backlog
-        total_requested_item=4400,  # Number of SKU in warehouse
-        items_orders_class_configuration={"A": 0.5, "B": 0.3, "C": 0.2},
-        quantity_range=[1, 12],  # Quantity range of number of SKU in each order
-        order_cycle_time=300,  # Number of order per hour
-        order_period_time=9,
-        order_start_arrival_time=0,
-        date=1,
-        sim_ver=2,
-        dev_mode=True)
+        initial_backlog=100,
+    )
     initRobots(universe)
     # Assign backlog clustering
     assign_backlog_orders(universe)
@@ -757,7 +744,7 @@ def assign_skus_to_pods(pod_manager):
     else:
         # Fungsi generate pods.csv
         # PodGenerator(pod_manager).generate()
-        PodGenerator(pod_types=[3], pod_num=[467], total_sku=4400,
+        PodGenerator(pod_types=[3], pod_num=[361], total_sku=4400,
                       items_class_conf={"A": 0.05228, "B": 0.12773, "C": 0.82},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},

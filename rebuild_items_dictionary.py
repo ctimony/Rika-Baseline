@@ -49,8 +49,8 @@ stats['rop_global'] = (
 # --- Coverage Days by ABC x XYZ ---
 coverage_map = {
     'AX': 1, 'AY': 1, 'AZ': 2,
-    'BX': 2, 'BY': 2, 'BZ': 3,
-    'CX': 3, 'CY': 4, 'CZ': 5,
+    'BX': 1, 'BY': 1, 'BZ': 2,
+    'CX': 1, 'CY': 2, 'CZ': 2,
 }
 stats['coverage_days'] = stats['abc_xyz'].map(coverage_map)
 
