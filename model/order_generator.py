@@ -337,44 +337,15 @@ def config_orders(initial_order, total_requested_item, items_orders_class_config
             print("    If you want to reconfigure the orders, please delete the generated_order.csv file.") 
 
     elif sim_ver == 2:
-        
-        print("Generate backlog orders...")
-        backlogs_path = os.path.join(parent_directory, 'generated_backlog.csv')
-        backlog_generated = False
-        if not os.path.exists(backlogs_path):
-            
-            print("    Generated backlog orders is not found. We will generate backlog orders.")
-            backlogs = gen_backlog(initial_order=initial_order, total_requested_item=total_requested_item, 
-                                   items_orders_class_configuration=items_orders_class_configuration,
-                                   quantity_range=quantity_range,
-                                   dev_mode=dev_mode)
-            backlog_generated = True
-        else:
-            backlogs = pd.read_csv(backlogs_path, index_col=False)
-            backlogs_id_list = backlogs["order_id"].unique().tolist()
-            
-            if initial_order == len(backlogs_id_list):
-                print("    Initial order is the same as the number of orders in the backlog file.")
-                print("    We will use the existing items file.")
-            
-            else:
-                print("    Initial order is different from the number of orders in the backlog file.")
-                print("    We will re-generate backlog orders using the new intial order.")
-                backlogs = gen_backlog(initial_order=initial_order, total_requested_item=total_requested_item, 
-                                       items_orders_class_configuration=items_orders_class_configuration,
-                                       quantity_range=quantity_range,
-                                       dev_mode=dev_mode)
-                backlog_generated = True
-        print("    Generate backlog orders is done. If you want to reconfigure the backlog orders, please delete the generated_backlog.csv file.")
 
         print("Generate orders...")
         generated_order_path = os.path.join(parent_directory, 'generated_order.csv')
         if not os.path.exists(generated_order_path):
             print("    Generated orders is not found. We will generate database orders:")
             orders = gen_order(order_cycle_time=order_cycle_time,
-                               order_period_time=order_period_time,  
-                               order_start_arrival_time=order_start_arrival_time,  
-                               total_requested_item=total_requested_item, 
+                               order_period_time=order_period_time,
+                               order_start_arrival_time=order_start_arrival_time,
+                               total_requested_item=total_requested_item,
                                items_orders_class_configuration=items_orders_class_configuration,
                                quantity_range=quantity_range,
                                date=date,
@@ -382,11 +353,37 @@ def config_orders(initial_order, total_requested_item, items_orders_class_config
             order_id_list = orders["order_dum"].unique().tolist()
             print("    "+str(len(order_id_list))+" orders are generated.")
             print("    Generate orders is done. If you want to reconfigure the orders, please delete the generated_order.csv file.")
-
         else:
             print("    Generated orders file is found. We will use the existing orders file.")
-            print("    If you want to reconfigure the orders, please delete the generated_order.csv file.")  
-    
+            print("    If you want to reconfigure the orders, please delete the generated_order.csv file.")
+
+        print("Generate backlog orders...")
+        backlogs_path = os.path.join(parent_directory, 'generated_backlog.csv')
+        backlog_generated = False
+        if not os.path.exists(backlogs_path):
+            print("    Generated backlog orders is not found. We will generate backlog orders.")
+            backlogs = gen_backlog(initial_order=initial_order, total_requested_item=total_requested_item,
+                                   items_orders_class_configuration=items_orders_class_configuration,
+                                   quantity_range=quantity_range,
+                                   dev_mode=dev_mode)
+            backlog_generated = True
+        else:
+            backlogs = pd.read_csv(backlogs_path, index_col=False)
+            backlogs_id_list = backlogs["order_id"].unique().tolist()
+
+            if initial_order == len(backlogs_id_list):
+                print("    Initial order is the same as the number of orders in the backlog file.")
+                print("    We will use the existing items file.")
+            else:
+                print("    Initial order is different from the number of orders in the backlog file.")
+                print("    We will re-generate backlog orders using the new initial order.")
+                backlogs = gen_backlog(initial_order=initial_order, total_requested_item=total_requested_item,
+                                       items_orders_class_configuration=items_orders_class_configuration,
+                                       quantity_range=quantity_range,
+                                       dev_mode=dev_mode)
+                backlog_generated = True
+        print("    Generate backlog orders is done. If you want to reconfigure the backlog orders, please delete the generated_backlog.csv file.")
+
         if backlog_generated:
             csv_files = ['generated_backlog.csv','generated_order.csv']
             dataframes = [pd.read_csv(file) for file in csv_files]

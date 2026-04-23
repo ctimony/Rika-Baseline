@@ -275,9 +275,10 @@ class Inventory(Universe):
                 "qty": quantity,
                 "order_id": order_id,
                 "processed_time": int(self._tick),
-                "task_type": 1
+                "task_type": 1,
+                "trigger": None
             }
-            
+
             new_row_df = pd.DataFrame([new_row])
             pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
             
@@ -298,12 +299,12 @@ class Inventory(Universe):
         # job.is_finished = True
         job.set_job_finish()
         if len(sku_need_replenished) > 0:
+            pod.last_trigger = 'global'
             return True
-        need_replenish_pod = pod.check_replenishment_needed()
-        print(f"reple ga yaaa {need_replenish_pod}")
-        # HACK
-        # return False
-        return need_replenish_pod
+        if pod.check_replenishment_needed():
+            pod.last_trigger = 'rop_per_pod'
+            return True
+        return False
     
     def finish_replenishment_task(self, job: RobotJob):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
