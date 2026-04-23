@@ -112,19 +112,18 @@ class Robot(Object):
 
     def calculateEnergy(self, velocity, acceleration):
         tick_unit = self.universe.tick_to_second
-       
+        avg_speed = velocity + acceleration * tick_unit / 2  # (vi + vf) / 2 per tick
+
         if acceleration > 0 and velocity != 0:
-            # average_speed = 2 * velocity + (acceleration * tick_unit)
-            e_accel = (self.mass + self.load_mass) * (acceleration * self._impact_resistance + self._gravity * self._friction) * velocity * tick_unit
-            return e_accel
+            # Paper Eq. 10: E_accel = (mL+mR) * (g*μr + ah*μir) * avg_speed * t
+            return (self.mass + self.load_mass) * (self._gravity * self._friction + acceleration * self._impact_resistance) * avg_speed * tick_unit
         elif acceleration < 0 and velocity != 0:
-            # average_speed = 2 * velocity + (acceleration * tick_unit)
-            e_decel = abs((self.mass + self.load_mass) * (acceleration * self._impact_resistance - self._gravity * self._friction) * velocity * tick_unit)
-            return e_decel
+            # Paper Eq. 12: E_decel = (mL+mR) * (ah*μir - g*μr) * avg_speed * t
+            return abs((self.mass + self.load_mass) * (acceleration * self._impact_resistance - self._gravity * self._friction) * avg_speed * tick_unit)
         elif velocity != 0:
-            e_const = (self.mass + self.load_mass) * self._gravity * self._friction * velocity * tick_unit
-            return e_const
-       
+            # Paper Eq. 8: E_cons = (mL+mR) * g * μr * v * t
+            return (self.mass + self.load_mass) * self._gravity * self._friction * velocity * tick_unit
+
         return 0
 
     def setPath(self, path):
@@ -190,6 +189,8 @@ class Robot(Object):
                 finish_time=self.universe._tick
             )
         elif self.current_state == "station_processing":
+            if self.job is not None:
+                self.load_mass = self.job.pod.mass  # refresh after picking at station
             self.current_state = "returning_pod"
         elif self.current_state == "returning_pod":
             # print(f"[DEBUG] finish returning pod {self.job.pod} to {self.destination}")
@@ -658,8 +659,11 @@ class Robot(Object):
         else:
             rotation_deg = 180
         rotation = np.radians(rotation_deg)
-        e_krot = 1/6 * (self.mass + self.load_mass) * (self._length + self._robot_width**2) * (rotation**2/2.5**2)
-        e_frot = (self.mass + self.load_mass) * self._gravity * self._friction * self._robot_radius * rotation
+        trot = self.delay_per_task * self.universe.tick_to_second  # 1.5 s
+        # Paper Eq. 14: E_krot = (1/6) * mR * (l^2 + w^2) * theta^2 / trot^2  — robot mass only
+        e_krot = (1/6) * self.mass * (self._length**2 + self._robot_width**2) * (rotation**2 / trot**2)
+        # Paper Eq. 15: E_frot = mR * g * μr * r * theta  — robot mass only
+        e_frot = self.mass * self._gravity * self._friction * self._robot_radius * rotation
         e_rot = e_krot + e_frot
         self.energy_consumption += e_rot
         self.turning += 1

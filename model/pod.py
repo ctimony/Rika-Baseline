@@ -14,6 +14,8 @@ class Pod(Object):
         self.station = None
         self.need_replenishment = False
         self.mass = 0
+        self.initial_mass = 0
+        self.last_trigger = None
         self.velocity = 0
         self.acceleration = 0
 
@@ -34,6 +36,10 @@ class Pod(Object):
     @property
     def coordinate(self):
         return NetLogoCoordinate(self.pos_x, self.pos_y)
+
+    def freeze_initial_mass(self):
+        """Call once after all add_sku() to lock initial_mass."""
+        self.initial_mass = self.mass
 
     def add_sku(self, sku, limit_qty, current_qty, threshold, weight, rop_per_pod=0):
         """Add a new SKU with its limit, current quantity, and threshold."""

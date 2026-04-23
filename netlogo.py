@@ -263,18 +263,21 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     # Config Orders
     assign_skus_to_pods(universe.pod_manager)
+    for pod in universe.pod_manager.pods:
+        pod.freeze_initial_mass()
 
-    from model.order_generator_tipp import gen_order_tipp
-    gen_order_tipp(
-        raw_order_path='raw_order.csv',
-        sim_duration_sec=28800,
-        start_hour=16,
+    config_orders(
+        initial_order=100,
+        total_requested_item=4400,
+        items_orders_class_configuration={"A": 0.32, "B": 0.35, "C": 0.33},
         quantity_range=[1, 12],
+        order_cycle_time=150,
+        order_period_time=8,
+        order_start_arrival_time=0,
         date=1,
-        initial_backlog=100,
-    )
+        sim_ver=2,
+        dev_mode=False)
     initRobots(universe)
-    # Assign backlog clustering
     assign_backlog_orders(universe)
 
     pod = list(universe.pod_manager.coordinate_to_pods.values())[0]
