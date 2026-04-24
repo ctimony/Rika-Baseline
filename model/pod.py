@@ -14,6 +14,8 @@ class Pod(Object):
         self.station = None
         self.need_replenishment = False
         self.mass = 0
+        self.initial_mass = 0
+        self.last_trigger = None
         self.velocity = 0
         self.acceleration = 0
 
@@ -34,6 +36,10 @@ class Pod(Object):
     @property
     def coordinate(self):
         return NetLogoCoordinate(self.pos_x, self.pos_y)
+
+    def freeze_initial_mass(self):
+        """Call once after all add_sku() to lock initial_mass."""
+        self.initial_mass = self.mass
 
     def add_sku(self, sku, limit_qty, current_qty, threshold, weight, rop_per_pod=0):
         """Add a new SKU with its limit, current quantity, and threshold."""
@@ -67,19 +73,24 @@ class Pod(Object):
         self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
 
     def replenish_all_skus_capped(self, wmax: float):
-        """Replenish SKUs up to limit_qty but stop if cumulative pod mass would exceed wmax."""
+        """Replenish SKUs up to limit_qty but stop if cumulative pod mass would exceed wmax.
+        Returns dict {sku: qty_added} for caller to update global inventory tracker."""
         remaining_capacity = wmax - self.mass
+        added = {}
         for sku in sorted(self.skus, key=lambda s: self.skus[s]['weight'], reverse=True):
             d = self.skus[sku]
             needed = d['limit_qty'] - d['current_qty']
             if needed <= 0:
                 continue
             addable = int(min(needed, remaining_capacity // d['weight'])) if d['weight'] > 0 else needed
-            d['current_qty'] += addable
-            remaining_capacity -= addable * d['weight']
+            if addable > 0:
+                d['current_qty'] += addable
+                remaining_capacity -= addable * d['weight']
+                added[sku] = addable
             if remaining_capacity <= 0:
                 break
         self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
+        return added
 
     def pick_sku(self, sku, qty):
         self.skus[sku]['current_qty'] -= qty

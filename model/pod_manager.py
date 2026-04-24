@@ -48,9 +48,14 @@ class PodManager:
             self.skus_data[sku_id]['max_global_qty'] += max_qty
             self.skus_data[sku_id]['global_inv_level'] = self.skus_data[sku_id]['current_global_qty'] / self.skus_data[sku_id]['max_global_qty']
 
-    def reduce_sku_data(self,sku,quantity):
-         if sku in self.skus_data:
+    def reduce_sku_data(self, sku, quantity):
+        if sku in self.skus_data:
             self.skus_data[sku]['current_global_qty'] -= quantity
+            self.skus_data[sku]['global_inv_level'] = self.skus_data[sku]['current_global_qty'] / self.skus_data[sku]['max_global_qty']
+
+    def restore_sku_data(self, sku, quantity):
+        if sku in self.skus_data:
+            self.skus_data[sku]['current_global_qty'] += quantity
             self.skus_data[sku]['global_inv_level'] = self.skus_data[sku]['current_global_qty'] / self.skus_data[sku]['max_global_qty']
 
     def get_all_skus_data(self):

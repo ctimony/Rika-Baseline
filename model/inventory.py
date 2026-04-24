@@ -198,11 +198,14 @@ class Inventory(Universe):
                             new_job = RobotJob(pod.coordinate, station_id=station_replenish.station_id, pod=pod)
                             new_job.add_replenishment_task(pod)
                             o.assign_job_and_set_move_to_station(new_job)
+                        else:
+                            self.pod_manager.mark_pod_available(pod)
 
                 # Reset completed jobs
                 if o.current_state == 'idle' and o.job is not None:
                     # self.pod_manager.mark_pod_available(o.job.pod_coordinate)
                     self.pod_manager.mark_pod_available(o.job.pod)
+                    print(f"[DEBUG] mark_pod_available pod {o.job.pod.pod_id} robot {o.id} job_finished={o.job.is_finished}")
                     o.job = None
                 
                 # Modify job if a new order is assign while pod is on the way
@@ -309,7 +312,9 @@ class Inventory(Universe):
     def finish_replenishment_task(self, job: RobotJob):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
-        pod.replenish_all_skus_capped(POD_WMAX)
+        replenished = pod.replenish_all_skus_capped(POD_WMAX)
+        for sku, qty_added in replenished.items():
+            self.pod_manager.restore_sku_data(sku, qty_added)
         pod_info_df = pd.read_csv('pod_info.csv')
         new_row = {
                 "pod_id": pod.pod_id,
@@ -317,7 +322,8 @@ class Inventory(Universe):
                 "qty": -1,
                 "order_id": -999,
                 "processed_time": int(self._tick),
-                "task_type": 2
+                "task_type": 2,
+                "trigger": pod.last_trigger
             }
             
         new_row_df = pd.DataFrame([new_row])
@@ -683,6 +689,9 @@ class Inventory(Universe):
         print(f"[DEBUG] pod_candidates={pod_candidates}")
 
         if not pod_candidates:
+            idle_count = sum(1 for p in self.pod_manager.pods if self.pod_manager.is_idle(p.pod_id))
+            total_count = len(self.pod_manager.pods)
+            print(f"[DEBUG] pod_candidates empty — idle pods: {idle_count}/{total_count}")
             return None, -1
 
         # Step 3: Score function

@@ -263,18 +263,21 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     # Config Orders
     assign_skus_to_pods(universe.pod_manager)
+    for pod in universe.pod_manager.pods:
+        pod.freeze_initial_mass()
 
-    from model.order_generator_tipp import gen_order_tipp
-    gen_order_tipp(
-        raw_order_path='raw_order.csv',
-        sim_duration_sec=28800,
-        start_hour=16,
+    config_orders(
+        initial_order=100,
+        total_requested_item=2000,
+        items_orders_class_configuration={"A": 0.35, "B": 0.39, "C": 0.26},
         quantity_range=[1, 12],
+        order_cycle_time=150,
+        order_period_time=8,
+        order_start_arrival_time=0,
         date=1,
-        initial_backlog=100,
-    )
+        sim_ver=2,
+        dev_mode=False)
     initRobots(universe)
-    # Assign backlog clustering
     assign_backlog_orders(universe)
 
     pod = list(universe.pod_manager.coordinate_to_pods.values())[0]
@@ -737,22 +740,57 @@ def add_all_direction_paths(graph, obj_key, weight):
         graph.add_edge(obj_key, neighbor_key, weight=weight)
 
 
+def generate_rop_summary():
+    import pandas as _pd
+    import numpy as _np
+    items_dict = _pd.read_csv('items_dictionary.csv')
+    items_csv = _pd.read_csv('items.csv', index_col=0)
+    items_csv['item_id'] = items_csv.index
+    pods = _pd.read_csv('pods.csv')
+
+    active = items_dict[items_dict['slots_needed'] > 0].copy()
+    active = active.merge(items_csv[['item_code', 'item_id']], on='item_code', how='left')
+
+    lead_time = 1 / 8
+    Z = 1.28
+    active['rop_global'] = (
+        active['mean_daily_demand'] * lead_time +
+        Z * active['std_daily_demand'] * _np.sqrt(lead_time)
+    ).clip(lower=1).round(0).astype(int)
+
+    assigned = pods[pods['max_qty'] > 0]
+    s_total = assigned.groupby('item')['max_qty'].sum().reset_index()
+    s_total.columns = ['item_id', 's_total']
+    pods_per_item = assigned.groupby('item')['pod_id'].nunique().reset_index()
+    pods_per_item.columns = ['item_id', 'num_pods']
+
+    result = active.merge(s_total, on='item_id', how='left')
+    result = result.merge(pods_per_item, on='item_id', how='left')
+    result['s_total'] = result['s_total'].fillna(0).astype(int)
+    result['num_pods'] = result['num_pods'].fillna(1).astype(int)
+    result['rop_per_pod'] = _np.ceil(result['rop_global'] / result['num_pods']).astype(int)
+
+    output = result[['item_code', 'item_id', 'num_pods', 's_total', 'rop_global', 'rop_per_pod']].copy()
+    output = output.rename(columns={'num_pods': 'n_slots'})
+    output = output.sort_values('item_id').reset_index(drop=True)
+    output.to_csv('rop_summary.csv', index=False)
+    print(f"Generated rop_summary.csv — {len(output)} SKUs")
+
+
 def assign_skus_to_pods(pod_manager):
     # Check if pods.csv exists in the current directory
-    if os.path.exists('pods.csv'):
-        assign_skus_to_pods_from_file(pod_manager)
-    else:
-        # Fungsi generate pods.csv
-        # PodGenerator(pod_manager).generate()
-        PodGenerator(pod_types=[3], pod_num=[361], total_sku=4400,
-                      items_class_conf={"A": 0.05228, "B": 0.12773, "C": 0.82},
+    if not os.path.exists('pods.csv'):
+        PodGenerator(pod_types=[3], pod_num=[244], total_sku=2000,
+                      items_class_conf={"A": 0.115, "B": 0.281, "C": 0.604},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
                       items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2},
                       pod_manager=pod_manager,
-                      pod_wmax=POD_WMAX,
+                      pod_wmax=1000.0,
                       dev_mode=False).generate()
-        assign_skus_to_pods_from_file(pod_manager)
+    if not os.path.exists('rop_summary.csv'):
+        generate_rop_summary()
+    assign_skus_to_pods_from_file(pod_manager)
 
 
 def assign_skus_to_pods_from_file(pod_manager: PodManager):
@@ -796,7 +834,7 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
         for key, value in skus_data.items():
             writer.writerow([key, value['current_global_qty'], value['max_global_qty'], value['global_inv_level']])
 
-    pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type"])
+    pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type", "trigger"])
     pod_info.to_csv("pod_info.csv", index=False)
 
     print(f"Data has been saved to {csv_file}")

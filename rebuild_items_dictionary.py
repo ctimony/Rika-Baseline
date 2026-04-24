@@ -57,14 +57,14 @@ stats['coverage_days'] = stats['abc_xyz'].map(coverage_map)
 # --- Item Initial Quantity Inventory ---
 stats['item_initial_quantity_inventory'] = (
     stats['mean_daily_demand'] * stats['coverage_days']
-).clip(lower=1).round(0).astype(int)
+).clip(lower=1).apply(np.ceil).astype(int)
 
 # --- Slots Needed (pod_type=3, slot_type=5, vol=60,000) ---
 stats = stats.merge(df[['item_code', 'box_volume', 'number_of_item_in_a_box']], on='item_code', how='left')
 excluded = stats[stats['box_volume'] >= 60000].copy()
 fitting_all = stats[stats['box_volume'] < 60000].copy()
 # Take top 4,000 SKUs by mean_daily_demand (all A+B preserved, top C by demand)
-fitting = fitting_all.sort_values('mean_daily_demand', ascending=False).head(4400).copy()
+fitting = fitting_all.sort_values('mean_daily_demand', ascending=False).head(2000).copy()
 excluded_low_demand = fitting_all[~fitting_all['item_code'].isin(fitting['item_code'])].copy()
 excluded_low_demand['slots_needed'] = 0
 print(f'Excluded {len(excluded)} SKUs (box_volume >= 60,000, do not fit pod_type=3)')
