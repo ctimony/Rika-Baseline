@@ -388,96 +388,122 @@ class Inventory(Universe):
         return result
 
     def process_orders(self):
+        # Step 1: Robot job initialization
+        robots_location = [
+            [o.pos_x, o.pos_y] for o in self.get_movable_objects()
+            if o.object_type == "robot" and (o.job is None or o.job.is_finished) and o.current_state == 'idle'
+            and len(self.job_queue) > 0
+        ]
+        # Step 2: Trigger preassign logic
+        if self.poa_first:
+            advanced_table = self.get_advanced_table()
+        # Step 3: Assign orders based on conditions
+        total_empty_bin = self.get_total_empty_bin()
+        if sum(total_empty_bin.values()) >= 1 and self._tick >= 1:
+            if self.poa_podmatch:
+                self.assign_order_old()
+            if self.poa_first:
+                self.assign_order()
+            if self.poa_second:
+                self.xxx()
+        # Step 4: Record last order for each station
+        if self.poa_first:
+            for st in [v for k, v in self.station_manager.stations_by_id.items() if 'picker' in k]:
+                self.last_order[st.station_id] = advanced_table.loc[advanced_table['station_id'] == st.station_id, 'order_id'].tolist()
+            print(self.last_order)
+        # Step 5: Start unfinished orders
         assign_order_df = pd.read_csv('assign_order.csv')
-
         for order in self.order_manager.unfinished_orders:
-            # Step 1: Assign order to a station if not yet assigned
             if order.station_id is None:
-                available_station = self.station_manager.find_highest_similarity_station(
-                    order.skus, self.pod_manager
-                )
-                if available_station is None:
-                    continue
-                order.assign_station(available_station.station_id)
-                available_station.add_order(order.order_id, order)
-                assign_order_df.loc[assign_order_df['order_id'] == order.order_id, 'assigned_station'] = available_station.station_id
-                assign_order_df.loc[assign_order_df['order_id'] == order.order_id, 'status'] = -1
-
+                continue
             if order.process_start_time <= 0:
                 order.start_processing(int(self._tick))
-
-            # Step 2: For each remaining SKU, find a pod and create a job
-            order_station = self.station_manager.get_station_by_id(order.station_id)
-            for sku in list(order.get_remaining_skus().keys()):
-                # Skip if already committed (status=0 means pod already assigned for this SKU line)
-                row_status = assign_order_df.loc[
-                    (assign_order_df['order_id'] == order.order_id) &
-                    (assign_order_df['item_id'] == sku), 'status'
-                ].values
-                if len(row_status) > 0 and row_status[0] == 0:
-                    continue
-
-                available_pod = self.pod_manager.get_available_pod(sku)
-                if available_pod is None:
-                    continue
-                if available_pod.get_quantity(sku) <= 0:
-                    continue
-
-                quantity_to_take = order.get_quantity_left_for_sku(sku)
-                if available_pod.get_quantity(sku) < quantity_to_take:
-                    quantity_to_take = available_pod.get_quantity(sku)
-
-                # Build job for this pod
-                job = RobotJob(available_pod.coordinate, station_id=order.station_id, pod=available_pod)
-                order.commit_quantity(sku, quantity_to_take)
-                available_pod.pick_sku(sku, quantity_to_take)
-                self.pod_manager.reduce_sku_data(sku, quantity_to_take)
-                job.add_picking_task(order.order_id, sku, quantity_to_take)
-
-                assign_order_df.loc[
-                    (assign_order_df['order_id'] == order.order_id) &
-                    (assign_order_df['item_id'] == sku),
-                    ['status', 'assigned_pod', 'order_processed']
-                ] = [0, int(available_pod.pod_id), int(self._tick)]
-
-                # Pile-on: pick other orders' SKUs from this same pod
-                for other_order in list(order_station.get_orders_in_station()):
-                    if other_order.order_id == order.order_id:
+        assign_order_df.to_csv('assign_order.csv', index=False)
+        # Step 6: Process PPS logic
+        if self.pps_demand or self.pps_pileon:
+            for station in filter(lambda s: s.station_type == 'picker' and len(s.incoming_pod) < 11, self.station_manager.stations):
+                priority_orders, general_orders = {}, {}
+                for order in station.orders:
+                    remaining_skus = order.get_remaining_skus()
+                    if 0 < len(remaining_skus) <= 2:
+                        if self.priority_order:
+                            priority_orders[order.order_id] = remaining_skus
+                        general_orders[order.order_id] = remaining_skus
+                    else:
+                        general_orders[order.order_id] = remaining_skus
+                print(f"[DEBUG] priority orders {priority_orders}")
+                # Handle priority orders first
+                if priority_orders:
+                    pod_assigned = False
+                    for order_id, remaining_skus in priority_orders.items():
+                        idle_pods = {pod for pod in self.pod_manager.sku_to_pods.get(list(remaining_skus.keys())[0], []) if self.pod_manager.is_idle(pod.pod_id)}
+                        for pod in idle_pods:
+                            pod_id = pod.pod_id
+                            print(f"[DEBUG] pod_id {pod_id} with")
+                            can_fulfill = any(
+                                sku in pod.skus and pod.skus[sku]["current_qty"] >= qty
+                                for sku, qty in remaining_skus.items()
+                            )
+                            print(f"[DEBUG] can fulfill {can_fulfill}")
+                            if can_fulfill:
+                                sku_to_quantity = {sku: qty for sku, qty in remaining_skus.items()}
+                                sku_to_order_map = {sku: [(order_id, qty)] for sku, qty in remaining_skus.items()}
+                                job = self.add_picking_task_after_pps(station, pod, sku_to_order_map, sku_to_quantity)
+                                self.job_queue.append(job)
+                                for sku, qty in sku_to_quantity.items():
+                                    upsert_job_task(
+                                        pod_id=str(pod.pod_id),
+                                        order_id=str(order_id),
+                                        sku=str(sku),
+                                        qty=str(qty),
+                                        assigned_station=station.station_id,
+                                        pod_assigned_time=self._tick,
+                                        status="queue",
+                                    )
+                                pod_assigned = True
+                                break
+                        if pod_assigned:
+                            break
+                    if pod_assigned:
                         continue
-                    for other_sku in list(other_order.get_remaining_skus().keys()):
-                        if other_sku not in available_pod.skus:
-                            continue
-                        if available_pod.get_quantity(other_sku) <= 0:
-                            continue
-                        other_row = assign_order_df.loc[
-                            (assign_order_df['order_id'] == other_order.order_id) &
-                            (assign_order_df['item_id'] == other_sku), 'status'
-                        ].values
-                        if len(other_row) > 0 and other_row[0] == 0:
-                            continue
-                        other_qty = other_order.get_quantity_left_for_sku(other_sku)
-                        take = min(other_qty, available_pod.get_quantity(other_sku))
-                        if take <= 0:
-                            continue
-                        other_order.commit_quantity(other_sku, take)
-                        available_pod.pick_sku(other_sku, take)
-                        self.pod_manager.reduce_sku_data(other_sku, take)
-                        job.add_picking_task(other_order.order_id, other_sku, take)
-                        assign_order_df.loc[
-                            (assign_order_df['order_id'] == other_order.order_id) &
-                            (assign_order_df['item_id'] == other_sku),
-                            ['status', 'assigned_pod', 'order_processed']
-                        ] = [0, int(available_pod.pod_id), int(self._tick)]
 
-                order_station.add_pod(available_pod.pod_id)
-                available_pod.station = order_station
-                self.pod_manager.mark_pod_not_available(available_pod)
-                order_station.reduce_sku_from_station(sku, quantity_to_take)
+                # Process general orders
+                sku_to_quantity, sku_to_order_map = defaultdict(int), defaultdict(list)
+                for o_id, remaining_skus in general_orders.items():
+                    for sku, qty in remaining_skus.items():
+                        sku_to_quantity[sku] += qty
+                        sku_to_order_map[sku].append((o_id, qty))
 
+                if not sku_to_quantity:
+                    print(f"skipping pod search for station {station.station_id}")
+                    continue
+
+                # Pod selection
+                if self.pps_demand:
+                    backlog_skus = defaultdict(int)
+                    for o in filter(lambda o: o.station_id is None and o.order_id not in self.order_manager.preassign_order_ids, self.order_manager.unfinished_orders):
+                        for sku, q in o.skus.items():
+                            backlog_skus[sku] += q["total_quantity"]
+                    pod, score = self.find_best_pod(backlog_skus, list(sku_to_quantity.keys()), mode="demand")
+                else:
+                    pod, score = self.find_best_pod(sku_to_quantity, list(sku_to_quantity.keys()), mode="pile_on")
+
+                if not pod:
+                    continue
+
+                job = self.add_picking_task_after_pps(station, pod, sku_to_order_map, sku_to_quantity)
                 if len(job.orders) > 0:
                     self.job_queue.append(job)
-
-        assign_order_df.to_csv('assign_order.csv', index=False)
+                    for triplet in job.orders:
+                        upsert_job_task(
+                            pod_id=str(job.pod.pod_id),
+                            order_id=str(triplet[0]),
+                            sku=str(triplet[1]),
+                            qty=str(triplet[2]),
+                            assigned_station=station.station_id,
+                            pod_assigned_time=self._tick,
+                            status="queue",
+                        )
 
     # def process_orders(self):
     #     robots_location = []
