@@ -269,7 +269,7 @@ def draw_layout_from_generated_file(universe: Inventory):
     config_orders(
         initial_order=100,
         total_requested_item=2000,
-        items_orders_class_configuration={"A": 0.35, "B": 0.39, "C": 0.26},
+        items_orders_class_configuration={"A": 0.60, "B": 0.30, "C": 0.10},
         quantity_range=[1, 12],
         order_cycle_time=150,
         order_period_time=8,
@@ -780,7 +780,7 @@ def generate_rop_summary():
 def assign_skus_to_pods(pod_manager):
     # Check if pods.csv exists in the current directory
     if not os.path.exists('pods.csv'):
-        PodGenerator(pod_types=[3], pod_num=[244], total_sku=2000,
+        PodGenerator(pod_types=[3], pod_num=[340], total_sku=2000,
                       items_class_conf={"A": 0.115, "B": 0.281, "C": 0.604},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},

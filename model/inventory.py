@@ -489,6 +489,26 @@ class Inventory(Universe):
                     pod, score = self.find_best_pod(sku_to_quantity, list(sku_to_quantity.keys()), mode="pile_on")
 
                 if not pod:
+                    for sku in sku_to_quantity:
+                        _, needs_replen = self.pod_manager.is_sku_need_replenished(sku)
+                        if not needs_replen:
+                            continue
+                        for candidate_pod in self.pod_manager.pods:
+                            if sku not in candidate_pod.skus:
+                                continue
+                            if not self.pod_manager.is_idle(candidate_pod.pod_id):
+                                continue
+                            station_replenish = self.station_manager.find_available_replenish_station()
+                            if station_replenish is None:
+                                break
+                            self.pod_manager.mark_pod_not_available(candidate_pod)
+                            station_replenish.add_pod(candidate_pod.pod_id)
+                            new_job = RobotJob(candidate_pod.coordinate,
+                                               station_id=station_replenish.station_id,
+                                               pod=candidate_pod)
+                            new_job.add_replenishment_task(candidate_pod)
+                            self.job_queue.append(new_job)
+                            break
                     continue
 
                 job = self.add_picking_task_after_pps(station, pod, sku_to_order_map, sku_to_quantity)

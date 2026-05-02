@@ -46,17 +46,10 @@ stats['rop_global'] = (
     Z * stats['std_daily_demand'] * np.sqrt(lead_time_days)
 ).clip(lower=1).round(0).astype(int)
 
-# --- Coverage Days by ABC x XYZ ---
-coverage_map = {
-    'AX': 1, 'AY': 1, 'AZ': 2,
-    'BX': 1, 'BY': 1, 'BZ': 2,
-    'CX': 1, 'CY': 2, 'CZ': 2,
-}
-stats['coverage_days'] = stats['abc_xyz'].map(coverage_map)
-
-# --- Item Initial Quantity Inventory ---
+# --- Item Initial Quantity Inventory: ROP(lead_time=1 day, k=1) ---
+# Initial stock = 1-day safety buffer; ROP trigger remains at lead_time=1/8 day
 stats['item_initial_quantity_inventory'] = (
-    stats['mean_daily_demand'] * stats['coverage_days']
+    stats['mean_daily_demand'] * 1 + Z * stats['std_daily_demand'] * np.sqrt(1)
 ).clip(lower=1).apply(np.ceil).astype(int)
 
 # --- Slots Needed (pod_type=3, slot_type=5, vol=60,000) ---

@@ -39,23 +39,26 @@ class Landscape:
         self._map[round(x)][round(y)].append(self._objects[label])
 
     def setObject(self, label, x, y, speed, acceleration, heading, state, load_mass):
+        rx, ry = max(0, min(self.dimension, round(x))), max(0, min(self.dimension, round(y)))
         if label not in self._objects:
-            return self._setObjectNew(label, x, y, speed, acceleration, heading, state, load_mass)
-        
+            return self._setObjectNew(label, rx, ry, speed, acceleration, heading, state, load_mass)
+
         old_x = round(self._objects[label]['x'])
         old_y = round(self._objects[label]['y'])
-        
+        old_x = max(0, min(self.dimension, old_x))
+        old_y = max(0, min(self.dimension, old_y))
+
         # check if x or y has changed
-        if round(x) != old_x or round(y) != old_y:
+        if rx != old_x or ry != old_y:
             # remove from old position
-            to_iter = self._map[old_x][old_y] 
+            to_iter = self._map[old_x][old_y]
             for index, e in enumerate(to_iter):
                 if e['label'] == label:
                     del to_iter[index]
                     break
 
             # add to new position
-            self._map[round(x)][round(y)].append(self._objects[label])
+            self._map[rx][ry].append(self._objects[label])
 
         movement = 'vertical'
         if heading == 270 or heading == 90:

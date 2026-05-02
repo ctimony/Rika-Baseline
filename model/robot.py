@@ -385,7 +385,9 @@ class Robot(Object):
         if self.eligible_to_reroute():
             if self.current_state == "taking_pod":
                 self.set_move(self.route_stop_points[-1], self.universe.graph, avoid_side=True)
-            elif self.current_state == "delivering_pod" or self.current_state == "returning_pod":
+            elif self.current_state == "delivering_pod":
+                self.set_move(self.route_stop_points[-1], self.universe.graph_pod, avoid_side=True, avoid_radius=3)
+            elif self.current_state == "returning_pod":
                 self.set_move(self.route_stop_points[-1], self.universe.graph_pod, avoid_side=True)
             elif self.current_state == "station_processing":
                 station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
@@ -490,7 +492,9 @@ class Robot(Object):
     def eligible_to_reroute(self):
          # if got into a zone, and the zone is full now
         # print(f"Masuk kesini per modulo 30 detik {self.universe._tick}")
-        if self.idle_time <= 50 or self.current_state == "delivering_pod":
+        if self.idle_time <= 50:
+            return False
+        if self.current_state == "delivering_pod" and self.idle_time <= 200:
             return False
 
         if self.is_in_station_path():
@@ -500,7 +504,11 @@ class Robot(Object):
                 return True
             else:
                 return False
-        
+
+        # delivering_pod robots stuck >200 ticks always reroute to break deadlocks
+        if self.current_state == "delivering_pod":
+            return True
+
         # Calculate next step coordinates
         next_step_coordinates = self._calculate_next_blocks(
             round(self.pos_x), round(self.pos_y), self.heading, 1, include_self=False)
@@ -986,7 +994,7 @@ class Robot(Object):
         station: Station = self.universe.station_manager.get_station_by_id(self.job.station_id)
         self.set_move(station.get_path()[0], graph=self.universe.graph_pod, need_neutralize_robot=False)
 
-    def set_move(self, dest: NetLogoCoordinate, graph, need_neutralize_robot: bool = False, avoid_side: bool = False):
+    def set_move(self, dest: NetLogoCoordinate, graph, need_neutralize_robot: bool = False, avoid_side: bool = False, avoid_radius: int = 1):
         start = self.coordinate_to_string_key(round(self.pos_x), round(self.pos_y))
         end = self.coordinate_to_string_key(round(dest.x), round(dest.y))
         # print(f"[DEBUG] set move start: {start} end: {end}")
@@ -995,7 +1003,7 @@ class Robot(Object):
 
         nodes_to_avoid = []
         if avoid_side:
-            avoid_coords = self.calculate_all_directions_next_blocks(round(self.pos_x), round(self.pos_y), 1,
+            avoid_coords = self.calculate_all_directions_next_blocks(round(self.pos_x), round(self.pos_y), avoid_radius,
                                                                      include_self=False)
             for avoid_coord in avoid_coords:
                 if self.universe.landscape.get_neighbor_object(*avoid_coord) is None:
