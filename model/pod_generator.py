@@ -76,10 +76,10 @@ class PodGenerator:
                 break
         return feasible
     
-    def gen_items(self, pod_types=[0], 
-              total_sku=500, 
-            #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65}, 
-              items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
+    def gen_items(self, pod_types=[3],
+              total_sku=3000,
+            #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65},
+              items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
               items_pods_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5}, 
               items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
               select_option=1, 
@@ -125,8 +125,10 @@ class PodGenerator:
 
             item_df = item_df.loc[item_df["item_code"].isin(item_code_arr)].copy()
             item_df = item_df.loc[item_df["slots_needed"] > 0].copy()
-            item_df = item_df[["item_code", "item_class", "item_order_frequency", "item_initial_quantity_inventory", "box_length", "box_width", "box_height", "box_volume", "box_weight", "number_of_item_in_a_box",
-                            "item_volume", "item_unit", "item_quantity_order_unique"]].copy()
+            item_df = item_df[["item_code", "item_class", "item_order_frequency", "item_initial_quantity_inventory",
+                               "mean_daily_demand", "cv",
+                               "box_length", "box_width", "box_height", "box_volume", "box_weight", "number_of_item_in_a_box",
+                               "item_volume", "item_unit", "item_quantity_order_unique"]].copy()
 
             # select items according to the class and its proportion
             items = pd.DataFrame()
@@ -136,27 +138,29 @@ class PodGenerator:
                 item = item_df.loc[item_df["item_class"] == class_name].copy()
                 item = item.sort_values(by="item_order_frequency", ascending=False)
 
-                # print(items_inventory_levels)
                 item["item_pod_inventory_level"] = items_pods_inventory_levels[class_name]
                 item["item_warehouse_inventory_level"] = items_warehouse_inventory_levels[class_name]
 
-                # calculate the probability of order frequency for each item
-                item_probability = item["item_order_frequency"] / \
-                    item["item_order_frequency"].sum()
+                n_select = int(total_sku * conf)
 
-                # select option 1: select items based on the probability of order frequency for each class.
-                # else: select items based on the top n-percent of the class ratio
+                # select option 1: weighted sampling by 3-factor geometric importance score
+                # else: top-N by order frequency
                 if select_option == 1:
+                    # Factor 1 — composite: mean_daily_demand × item_order_frequency
+                    # Factor 2 — stability: item_order_frequency (proportional to 1/avg_demand_interval)
+                    # Factor 3 — variability: cv²
+                    f1 = item["mean_daily_demand"] * item["item_order_frequency"]
+                    f2 = item["item_order_frequency"]
+                    f3 = item["cv"] ** 2
+                    importance = (f1.clip(lower=1e-9) * f2.clip(lower=1e-9) * f3.clip(lower=1e-9)) ** (1/3)
+                    item_probability = (importance / importance.sum()).to_numpy()
 
-                    # select items based on the probability of order frequency for each class.
-                    item_code = np.random.choice(item["item_code"].to_list(), size=int(
-                        total_sku*conf), p=item_probability, replace=False)
-                    items = pd.concat(
-                        [items, item.loc[item["item_code"].isin(item_code)]])
+                    item_code = np.random.choice(item["item_code"].to_list(), size=n_select,
+                                                 p=item_probability, replace=False)
+                    items = pd.concat([items, item.loc[item["item_code"].isin(item_code)]])
                 else:
-
                     # select items based on the top n-percent of the class ratio
-                    item_top = item.head(int(total_sku*conf))
+                    item_top = item.head(n_select)
                     items = pd.concat([items, item_top])
 
             # save items selected to csv
@@ -223,130 +227,154 @@ class PodGenerator:
         pods.reset_index(drop=True, inplace=True)
         return pods
     
-    def assign_items_to_pods(self, pods, items, items_pods_class_conf, dev_mode=False):
+    def assign_items_to_pods(self, pods, items, items_pods_class_conf,
+                             class_slot_counts={"A": 13, "B": 4, "C": 3},
+                             dev_mode=False):
 
         working_path = self.get_working_path(dev_mode)
+
+        # ── Phase 1: Prepare ──────────────────────────────────────────────────
         pods_dictionary_path = working_path + "/pods_dictionary.csv"
         pods_dictionary = pd.read_csv(pods_dictionary_path, index_col=False)
+        slot_types = pods_dictionary.loc[
+            pods_dictionary["pod_type"].isin(pods["pod_type"].unique()),
+            "slot_type"
+        ].unique()
 
-        slot_types = pods_dictionary.loc[pods_dictionary["pod_type"].isin(pods.loc[:, "pod_type"]),
-                                        ["slot_type", "slot_volume"]].sort_values(by="slot_volume", ascending=False).loc[:, "slot_type"].unique()
-        slot_volumes = pods_dictionary.loc[pods_dictionary["pod_type"].isin(pods.loc[:, "pod_type"]),
-                                        ["slot_type", "slot_volume"]].sort_values(by="slot_volume", ascending=False).loc[:, "slot_volume"].unique()
-        pods["slot_sequence"] = np.arange(0, pods.shape[0])
-
-        item_slot_configuration_path = working_path + "/items_slots_configuration.csv"
-        items_slots_configuration = pd.read_csv(item_slot_configuration_path, index_col=False)
-        items_slots_configuration_selected = items_slots_configuration.loc[(items_slots_configuration["item_code"].isin(items["item_code"].unique())) &
-                                                                    (items_slots_configuration["slot_type"].isin(slot_types)) &
-                                                                    (items_slots_configuration["max_box_in_slot"] > 0)]
+        item_slot_cfg_path = working_path + "/items_slots_configuration.csv"
+        items_slots_cfg = pd.read_csv(item_slot_cfg_path, index_col=False)
+        items_slots_cfg_sel = items_slots_cfg.loc[
+            (items_slots_cfg["item_code"].isin(items["item_code"].unique())) &
+            (items_slots_cfg["slot_type"].isin(slot_types)) &
+            (items_slots_cfg["max_item_in_slot"] > 0)
+        ].copy()
 
         items["item_id"] = items.index
-        items_slots_configuration_selected = items_slots_configuration_selected.merge(items[["item_id",
-                                                                                            "item_code",
-                                                                                            "item_class",
-                                                                                            "box_weight",
-                                                                                            "item_weight",
-                                                                                            "item_order_frequency",
-                                                                                            "item_initial_quantity_inventory",
-                                                                                            "item_pod_inventory_level",
-                                                                                            "item_warehouse_inventory_level"]
-                                                                                            ].copy(), how='inner', on='item_code')
-        items_slots_configuration_selected["item_slot_needed"] = np.ceil(
-            (items_slots_configuration_selected["item_initial_quantity_inventory"] / items_slots_configuration_selected["number_of_item_in_a_box"]) / items_slots_configuration_selected["max_box_in_slot"]).astype(int)
+        items_slots_cfg_sel = items_slots_cfg_sel.merge(
+            items[["item_id", "item_code", "item_class", "item_weight",
+                   "item_initial_quantity_inventory",
+                   "item_pod_inventory_level", "item_warehouse_inventory_level"]].copy(),
+            how="inner", on="item_code"
+        )
 
-        for s in range(len(slot_volumes)):
-            if s == (len(slot_volumes)-1):
-                items_slots_volume_filtered = items_slots_configuration_selected.loc[(items_slots_configuration_selected["box_volume"] < slot_volumes[s]),
-                                                        ["item_id", "item_class", "slot_type",
-                                                            "number_of_item_in_a_box", "max_box_in_slot", "max_item_in_slot", "item_weight",
-                                                            "item_initial_quantity_inventory", "item_pod_inventory_level", "item_warehouse_inventory_level"
-                                                            ]].sort_values(by=["item_class", "item_initial_quantity_inventory"], ascending=[True, False])
-            else:
-                items_slots_volume_filtered = items_slots_configuration_selected.loc[(items_slots_configuration_selected["box_volume"] < slot_volumes[s]) &
-                                                        (items_slots_configuration_selected["box_volume"] >= slot_volumes[s+1]),
-                                                        ["item_id", "item_class", "slot_type",
-                                                            "number_of_item_in_a_box", "max_box_in_slot", "max_item_in_slot", "item_weight",
-                                                            "item_initial_quantity_inventory", "item_pod_inventory_level", "item_warehouse_inventory_level"
-                                                            ]].sort_values(by=["item_class", "item_initial_quantity_inventory"], ascending=[True, False])
+        # One row per item: use the slot_type present in pods (take first match)
+        items_to_place = (
+            items_slots_cfg_sel
+            .sort_values(["item_class", "item_id"])
+            .drop_duplicates(subset="item_id", keep="first")
+            [["item_id", "item_code", "item_class", "max_item_in_slot",
+              "item_weight", "item_initial_quantity_inventory",
+              "item_pod_inventory_level", "item_warehouse_inventory_level"]]
+            .copy()
+        )
+        items_to_place = items_to_place[
+            items_to_place["item_initial_quantity_inventory"] > 0
+        ].copy()
 
-            if len(items_slots_volume_filtered) > 0:
-                item_fitted = items_slots_volume_filtered.loc[:, "item_id"].unique()
-                slot_fitted = items_slots_volume_filtered.loc[:, "slot_type"].unique()
+        pods["slot_sequence"] = np.arange(pods.shape[0])
 
-                for item_id in item_fitted:
-                    item_initial_quantity_needed = items.loc[items["item_id"] == item_id, "item_initial_quantity_inventory"].values[0]
-                    weight_full_pods = set()
-                    while (item_initial_quantity_needed > 0):
-                        pod_available = list(
-                            (set(pods.loc[(pods["item"] != item_id) & (pods["item"].isnull()) & (pods["slot_type"].isin(slot_fitted)), "pod_id"].unique().tolist()) -
-                             set(pods.loc[(pods["item"] == item_id) & (pods["item"].notnull()) & (pods["slot_type"].isin(slot_fitted)), "pod_id"].unique().tolist())) -
-                            weight_full_pods
-                        )
-                        if len(pod_available) == 0:
-                            print("    All pod is unavailable for item_id:", item_id, item_initial_quantity_needed)
-                            print("    Break the loop")
-                            break
-                        else:
-                            pod_id = np.random.choice(pod_available)
-                            pod = pods.loc[pods["pod_id"] == pod_id]
-                            slot_available = pod.loc[(pod["item"] != item_id) & (pod["item"].isnull()) & (pod["slot_type"].isin(slot_fitted)), "slot_id"].unique()
-                            if len(slot_available) == 0:
-                                continue
-                            else:
-                                slot_id = np.random.choice(slot_available)
-                                slot_type = pod.loc[pod["slot_id"] == slot_id, "slot_type"].values[0]
+        # ── Phase 2: Build virtual slot pools per class (round-robin across pods) ─
+        # Round-robin ensures consecutive pool entries are from DIFFERENT pods,
+        # so taking slots_needed consecutive entries places each slot in a different pod.
+        print("    Building proportional slot pools (A=%d, B=%d, C=%d per pod)..." % (
+            class_slot_counts.get("A", 0),
+            class_slot_counts.get("B", 0),
+            class_slot_counts.get("C", 0)))
 
-                                max_item_in_slot = items_slots_volume_filtered.loc[(items_slots_volume_filtered["item_id"] == item_id) &
-                                                                                (items_slots_volume_filtered["slot_type"] == slot_type),
-                                                                                "max_item_in_slot"].to_numpy()[0]
+        # Collect per-class slot indices grouped by pod, then interleave
+        class_slots_by_pod = {cls: [] for cls in class_slot_counts}
+        for _, grp in pods[pods["item"].isnull()].groupby("pod_id"):
+            indices = grp.index.tolist()
+            cursor = 0
+            for cls, count in class_slot_counts.items():
+                class_slots_by_pod[cls].append(indices[cursor:cursor + count])
+                cursor += count
 
-                                item_weight = items_slots_volume_filtered.loc[(items_slots_volume_filtered["item_id"] == item_id) &
-                                                                            (items_slots_volume_filtered["slot_type"] == slot_type),
-                                                                            "item_weight"].to_numpy()[0]
+        # Interleave: [pod0_slot0, pod1_slot0, pod2_slot0, ..., pod0_slot1, pod1_slot1, ...]
+        class_pools = {}
+        for cls, pods_slots in class_slots_by_pod.items():
+            max_slots = max(len(s) for s in pods_slots) if pods_slots else 0
+            interleaved = []
+            for slot_idx in range(max_slots):
+                for pod_slots in pods_slots:
+                    if slot_idx < len(pod_slots):
+                        interleaved.append(pod_slots[slot_idx])
+            class_pools[cls] = interleaved
 
-                                qty = max_item_in_slot.astype(int)
-                                max_qty = max_item_in_slot.astype(int)
+        # ── Phase 3: Main assignment — class by class from pool ───────────────
+        unplaced_ids = set()
+        for cls, pool in class_pools.items():
+            pool_cursor = 0
+            cls_items = items_to_place[items_to_place["item_class"] == cls]
+            print(f"    Class {cls}: {len(cls_items)} SKUs → {len(pool)} pool slots")
 
-                                pod_current_weight = pods.loc[pods["pod_id"] == pod_id, "total_item_weight"].sum()
-                                remaining_capacity = max(0.0, self.pod_wmax - pod_current_weight)
-                                if item_weight > 0:
-                                    qty = int(min(qty, remaining_capacity // item_weight))
-                                qty = max(qty, 0)
+            for _, row in cls_items.iterrows():
+                max_fit = int(row["max_item_in_slot"])
+                if max_fit <= 0:
+                    max_fit = 1
+                slots_needed = int(np.ceil(row["item_initial_quantity_inventory"] / max_fit))
+                remaining = len(pool) - pool_cursor
 
-                                if qty == 0:
-                                    weight_full_pods.add(pod_id)
-                                    continue
+                if remaining >= slots_needed:
+                    idxs = pool[pool_cursor:pool_cursor + slots_needed]
+                    pods.loc[idxs, "item"]                          = int(row["item_id"])
+                    pods.loc[idxs, "qty"]                           = max_fit
+                    pods.loc[idxs, "max_qty"]                       = max_fit
+                    pods.loc[idxs, "item_weight"]                   = row["item_weight"]
+                    pods.loc[idxs, "total_item_weight"]             = round(row["item_weight"] * max_fit, 3)
+                    pods.loc[idxs, "item_pod_inventory_level"]      = row["item_pod_inventory_level"]
+                    pods.loc[idxs, "item_warehouse_inventory_level"]= row["item_warehouse_inventory_level"]
+                    pool_cursor += slots_needed
+                else:
+                    unplaced_ids.add(int(row["item_id"]))
 
-                                max_qty = qty
-                                total_item_weight = round(item_weight * qty, 3)
+        # ── Phase 4: Mop-up — place overflow items in any remaining null slots ─
+        # One slot per pod constraint: pick at most one empty slot per pod per item.
+        if unplaced_ids:
+            print(f"    Mop-up: {len(unplaced_ids)} items unplaced, using remaining empty slots...")
+            mop_items = items_to_place[items_to_place["item_id"].isin(unplaced_ids)]
+            for _, row in mop_items.iterrows():
+                empty_df = pods[pods["item"].isnull()][["pod_id"]].copy()
+                if empty_df.empty:
+                    print(f"    WARNING: No slots left for item_id {int(row['item_id'])}")
+                    break
+                max_fit = int(row["max_item_in_slot"])
+                if max_fit <= 0:
+                    max_fit = 1
+                slots_needed = int(np.ceil(row["item_initial_quantity_inventory"] / max_fit))
+                # Pick one empty slot per pod, one pod per slot_needed
+                # groupby keeps original pods index; take the first empty slot per pod
+                one_per_pod_idx = empty_df.groupby("pod_id").apply(lambda g: g.index[0], include_groups=False).tolist()
+                if len(one_per_pod_idx) >= slots_needed:
+                    idxs = one_per_pod_idx[:slots_needed]
+                else:
+                    idxs = one_per_pod_idx
+                if not idxs:
+                    print(f"    WARNING: Not enough slots for item_id {int(row['item_id'])} (need {slots_needed}, have 0)")
+                    continue
+                pods.loc[idxs, "item"]                          = int(row["item_id"])
+                pods.loc[idxs, "qty"]                           = max_fit
+                pods.loc[idxs, "max_qty"]                       = max_fit
+                pods.loc[idxs, "item_weight"]                   = row["item_weight"]
+                pods.loc[idxs, "total_item_weight"]             = round(row["item_weight"] * max_fit, 3)
+                pods.loc[idxs, "item_pod_inventory_level"]      = row["item_pod_inventory_level"]
+                pods.loc[idxs, "item_warehouse_inventory_level"]= row["item_warehouse_inventory_level"]
+                print(f"    Mop-up: item_id {int(row['item_id'])} (Class {row['item_class']}) placed in {len(idxs)} slots")
 
-                                item_inventory_level = items_slots_volume_filtered.loc[(items_slots_volume_filtered["item_id"] == item_id), "item_pod_inventory_level"].to_numpy()[0]
-                                item_global_level = items_slots_volume_filtered.loc[(items_slots_volume_filtered["item_id"] == item_id), "item_warehouse_inventory_level"].to_numpy()[0]
-
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "item"] = item_id
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "qty"] = qty
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "max_qty"] = max_qty
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "item_weight"] = item_weight
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "total_item_weight"] = total_item_weight
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "item_pod_inventory_level"] = item_inventory_level
-                                pods.loc[(pods["pod_id"] == pod_id) & (pods["slot_id"] == slot_id), "item_warehouse_inventory_level"] = item_global_level
-
-                                item_initial_quantity_needed -= qty
-
-        # make sure the qty and max_qty are integer; unassigned slots remain with item=0, qty=0
+        # ── Phase 5: Finalize and save ────────────────────────────────────────
         pods[["item", "qty", "max_qty"]] = pods[["item", "qty", "max_qty"]].fillna(0).astype(int)
-
         pods = pods.sort_values(["pod_id", "slot_sequence"]).reset_index(drop=True)
         pods["cumulative_pod_weight"] = pods.groupby("pod_id")["total_item_weight"].cumsum().round(3)
 
-        pods.to_csv(working_path + "/pods.csv", index=False)
+        assigned = (pods["item"] > 0).sum()
+        print(f"    Assignment complete: {assigned:,} slots filled / {len(pods):,} total")
 
+        pods.to_csv(working_path + "/pods.csv", index=False)
         return pods
     
-    def config_items_pods(self,pod_types=[0], pod_num=[420], total_sku=500, 
+    def config_items_pods(self, pod_types=[3], pod_num=[377], total_sku=3000,
                     #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65},
-                      items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
+                      items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
                     #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1}, # original

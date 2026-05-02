@@ -268,8 +268,8 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     config_orders(
         initial_order=100,
-        total_requested_item=2000,
-        items_orders_class_configuration={"A": 0.60, "B": 0.30, "C": 0.10},
+        total_requested_item=3000,
+        items_orders_class_configuration={"A": 0.79, "B": 0.17, "C": 0.04},
         quantity_range=[1, 12],
         order_cycle_time=150,
         order_period_time=8,
@@ -749,14 +749,11 @@ def generate_rop_summary():
     pods = _pd.read_csv('pods.csv')
 
     active = items_dict[items_dict['slots_needed'] > 0].copy()
-    active = active.merge(items_csv[['item_code', 'item_id']], on='item_code', how='left')
+    # Inner join: keep only the 3,000 selected SKUs that are in items.csv
+    active = active.merge(items_csv[['item_code', 'item_id']], on='item_code', how='inner')
 
-    lead_time = 1 / 8
-    Z = 1.28
-    active['rop_global'] = (
-        active['mean_daily_demand'] * lead_time +
-        Z * active['std_daily_demand'] * _np.sqrt(lead_time)
-    ).clip(lower=1).round(0).astype(int)
+    # rop_global already computed per-SKU with correct per-class Z in items_dictionary.csv
+    active['rop_global'] = active['rop_global'].clip(lower=1).round(0).astype(int)
 
     assigned = pods[pods['max_qty'] > 0]
     s_total = assigned.groupby('item')['max_qty'].sum().reset_index()
@@ -780,8 +777,8 @@ def generate_rop_summary():
 def assign_skus_to_pods(pod_manager):
     # Check if pods.csv exists in the current directory
     if not os.path.exists('pods.csv'):
-        PodGenerator(pod_types=[3], pod_num=[340], total_sku=2000,
-                      items_class_conf={"A": 0.115, "B": 0.281, "C": 0.604},
+        PodGenerator(pod_types=[3], pod_num=[377], total_sku=3000,
+                      items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
                       items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2},

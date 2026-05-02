@@ -85,10 +85,10 @@ def check_items_pods_feasibility(total_sku, pod_types, pods_dictionary):
     return feasible
 
 
-def gen_items(pod_types=[0], 
-              total_sku=500, 
-            #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65}, 
-              items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
+def gen_items(pod_types=[3],
+              total_sku=3000,
+            #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65},
+              items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
               items_pods_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5}, 
               items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
               select_option=1, 
@@ -540,9 +540,9 @@ def assign_items_to_pods(pods, items, items_pods_class_conf, dev_mode=False):
     
     return pods
                             
-def config_items_pods(pod_types=[0], pod_num=[420], total_sku=1000, 
+def config_items_pods(pod_types=[3], pod_num=[377], total_sku=3000,
                     #   items_class_conf={"A": 0.07, "B": 0.28, "C": 0.65},
-                      items_class_conf={"A": 0.1, "B": 0.3, "C": 0.6},
+                      items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
                     #   items_pods_class_conf={"A": 0.7, "B": 0.2, "C": 0.1},

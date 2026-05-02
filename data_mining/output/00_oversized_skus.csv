@@ -1,0 +1,4 @@
+item_code,item_name,box_length,box_width,box_height,box_volume,box_weight,number_of_item_in_a_box,item_volume,item_unit,item_order_frequency,item_relative_importance,item_quantity_order_mean,item_quantity_order_std,item_quantity_order_total,item_quantity_order_unique,item_quantity_order_unique_frequency,item_class,item_initial_quantity_inventory,mean_daily_demand,std_daily_demand,cv,abc_xyz,rop_global,slots_needed
+14023032001,卡滋格子脆香濃起司口味,118.0,100.0,36.0,424800.0,15.4,8.0,53100.0,PCS,23.0,0.8771087148547524,1.125,0.338,27,"[1, 2]","[21, 3]",C,3,1.2857,1.1892,0.925,CY,1,0
+65031070001,SR高彈力抗壓透氣枕,85.0,52.0,60.0,265200.0,7.8,10.0,26520.0,PCS,1.0,0.9999933334444426,1.0,0.0,1,[1],[1],C,1,0.0476,0.2182,4.5826,CZ,1,0
+65031073001,SR健康樂活竹炭枕,73.0,52.0,67.0,254332.0,5.0,10.0,25433.2,PCS,4.0,0.9870768820519658,2.0,0.0,8,[2],[4],C,2,0.381,0.8047,2.1125,CZ,1,0

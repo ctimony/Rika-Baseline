@@ -6,17 +6,12 @@ items_csv = pd.read_csv('items.csv', index_col=0)
 items_csv['item_id'] = items_csv.index
 pods = pd.read_csv('pods.csv')
 
-# Active SKUs only
+# Active SKUs only — inner join keeps only the selected SKUs in items.csv
 active = items_dict[items_dict['slots_needed'] > 0].copy()
-active = active.merge(items_csv[['item_code', 'item_id']], on='item_code', how='left')
+active = active.merge(items_csv[['item_code', 'item_id']], on='item_code', how='inner')
 
-# ROP global with lead_time = 1/8 day, Z = 1.28 (90% service level)
-lead_time = 1 / 8
-Z = 1.28
-active['rop_global'] = (
-    active['mean_daily_demand'] * lead_time +
-    Z * active['std_daily_demand'] * np.sqrt(lead_time)
-).clip(lower=1).round(0).astype(int)
+# rop_global already computed per-SKU with correct per-class Z in items_dictionary.csv
+active['rop_global'] = active['rop_global'].clip(lower=1).round(0).astype(int)
 
 # S_total: sum of max_qty across all pods per item
 assigned = pods[pods['max_qty'] > 0]
@@ -43,7 +38,7 @@ output = output.sort_values('item_id').reset_index(drop=True)
 
 output.to_csv('rop_summary.csv', index=False)
 print(f"Saved rop_summary.csv — {len(output)} SKUs")
-print(f"\nLead time: 1/8 day = 3 hours, Z = 1.28 (90% service level)")
+print(f"\nROP global read from items_dictionary.csv (per-class Z: A/CV0=99%, A/CV1=B/CV1=95%, rest=90%)")
 print(f"\nROP global stats:")
 print(output['rop_global'].describe())
 print(f"\nROP per pod stats:")
