@@ -85,7 +85,7 @@ class Landscape:
         while i < x+check:
             j = y+radius
             while j > y-check:
-                if i >= 0 and j >= 0:
+                if i >= 0 and j >= 0 and i <= self.dimension and j <= self.dimension:
                     if i != x or j != y:
                         points_to_check.append([i, j])
                 j -= 1
