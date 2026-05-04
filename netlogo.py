@@ -795,6 +795,11 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
     rop_df = _pd.read_csv('rop_summary.csv')
     rop_dict = dict(zip(rop_df['item_id'].astype(int),
                         zip(rop_df['rop_global'].astype(int), rop_df['rop_per_pod'].astype(int))))
+    n_slots_dict = dict(zip(rop_df['item_id'].astype(int), rop_df['n_slots'].astype(int)))
+
+    import pandas as _pd_cls
+    _items_cls = _pd_cls.read_csv('items.csv').reset_index()
+    item_class_dict = dict(zip(_items_cls['item_id'], _items_cls['item_class']))
 
     with open('pods.csv', mode='r', newline='') as file:
         reader = csv.DictReader(file)
@@ -818,7 +823,9 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
             pod_manager.add_sku_to_pod(sku, pod)
 
             # Add SKU Data of level
-            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val)
+            item_class = item_class_dict.get(int(sku), 'C')
+            n_slots_val = n_slots_dict.get(int(sku), 1)
+            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val, item_class, n_slots_val)
 
     csv_file = 'skus_data.csv'
     if os.path.exists(csv_file):

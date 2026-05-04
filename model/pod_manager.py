@@ -32,7 +32,7 @@ class PodManager:
             self.sku_to_pods[sku] = []
         self.sku_to_pods[sku].append(pod)
 
-    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0):
+    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0, item_class='C', n_slots=1):
         sku_id = sku
 
         if sku_id not in self.skus_data:
@@ -42,11 +42,14 @@ class PodManager:
                 'global_inv_level': (current_qty / max_qty),
                 'global_threshold_inv_level': global_threshold_inv_level,
                 'rop_global': rop_global,
+                'item_class': item_class,
+                'n_slots': n_slots,
             }
         else:
             self.skus_data[sku_id]['current_global_qty'] += current_qty
             self.skus_data[sku_id]['max_global_qty'] += max_qty
             self.skus_data[sku_id]['global_inv_level'] = self.skus_data[sku_id]['current_global_qty'] / self.skus_data[sku_id]['max_global_qty']
+            # Do NOT update item_class or n_slots — set only on first insert
 
     def reduce_sku_data(self, sku, quantity):
         if sku in self.skus_data:
@@ -94,6 +97,42 @@ class PodManager:
             # Put in the result of the sum probability of each pod to the stock_out_probability_of_each_pod
         # Return the pod.pod_id with the highest value of stock_out_probability_of_each_pod
         
+    def compute_opportunity_score(self, pod) -> float:
+        triggering_skus = [
+            sku for sku in pod.skus
+            if sku in self.skus_data
+            and self.skus_data[sku]['current_global_qty'] <= self.skus_data[sku]['rop_global']
+            and pod.skus[sku]['current_qty'] < pod.skus[sku]['limit_qty']
+        ]
+
+        if not triggering_skus:
+            return 0.0
+
+        max_score = 0.0
+        for sku in triggering_skus:
+            data = self.skus_data[sku]
+            max_global = data['max_global_qty']
+            current_global = data['current_global_qty']
+            pod_qty = pod.skus[sku]['current_qty']
+            limit_qty = pod.skus[sku]['limit_qty']
+            n_slots = max(data.get('n_slots', 1), 1)
+
+            stock_depletion = 1 - (current_global / max_global) if max_global > 0 else 1.0
+            pod_depletion_ratio = 1 - (pod_qty / limit_qty) if limit_qty > 0 else 1.0
+            redundancy_factor = 1.0 / n_slots
+
+            score = stock_depletion * pod_depletion_ratio * redundancy_factor
+            max_score = max(max_score, score)
+
+        return max_score
+
+    def has_other_idle_pod_with_qty(self, sku, excluding_pod) -> bool:
+        """Return True if any idle pod OTHER than excluding_pod has qty > 0 for this SKU."""
+        for pod in self.sku_to_pods.get(sku, []):
+            if pod.pod_id != excluding_pod.pod_id and self.is_idle(pod.pod_id) and pod.skus[sku]['current_qty'] > 0:
+                return True
+        return False
+
     def get_available_pod(self, sku: str):
         if sku in self.sku_to_pods:
             for pod in self.sku_to_pods[sku]:

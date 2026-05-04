@@ -40,6 +40,8 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)  # Let it auto-expand
 
 POD_WMAX = 600.0  # kg — max pod load weight
+USE_OPPORTUNITY_SCORE = True   # Set False to run baseline (immediate replenishment)
+REPLENISHMENT_THRESHOLD = 0.7  # Only used when USE_OPPORTUNITY_SCORE = True
 
 class Inventory(Universe):
     dimension = 60
@@ -85,8 +87,8 @@ class Inventory(Universe):
         self.poa_first = False  # preasign2 gajelas nih / F3
         self.poa_second = True
 
-        self.pps_pileon = True    
-        self.pps_demand = False    
+        self.pps_pileon = True
+        self.pps_demand = False
 
         self.priority_order = False
 
@@ -191,7 +193,7 @@ class Inventory(Universe):
                         pod: Pod = self.pod_manager.get_pod_by_id(o.job.pod.pod_id)
                         latest_pod_location = get_pod_location(pod.pod_id)
                         if latest_pod_location:
-                            pod.pos_x, pod.pos_y = latest_pod_location
+                            pod.pos_x, pod.pos_y = int(latest_pod_location[0]), int(latest_pod_location[1])
                         station_replenish = self.station_manager.find_available_replenish_station()
                         if station_replenish is not None:
                             station_replenish.add_pod(pod.pod_id)
@@ -199,13 +201,15 @@ class Inventory(Universe):
                             new_job.add_replenishment_task(pod)
                             o.assign_job_and_set_move_to_station(new_job)
                         else:
-                            self.pod_manager.mark_pod_available(pod)
+                            # No replenishment station slot free — let pod return to idle; replenishment re-triggered on next pick
+                            pass
+                    # If deferred (need_replenish_pod=False), robot continues returning_pod normally.
+                    # mark_pod_available is called at line below when robot reaches idle state.
 
                 # Reset completed jobs
                 if o.current_state == 'idle' and o.job is not None:
                     # self.pod_manager.mark_pod_available(o.job.pod_coordinate)
                     self.pod_manager.mark_pod_available(o.job.pod)
-                    print(f"[DEBUG] mark_pod_available pod {o.job.pod.pod_id} robot {o.id} job_finished={o.job.is_finished}")
                     o.job = None
                 
                 # Modify job if a new order is assign while pod is on the way
@@ -254,20 +258,11 @@ class Inventory(Universe):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
         pod_info_df = pd.read_csv('pod_info.csv')
-        sku_need_replenished = []
         for order_id, sku, quantity in job.orders:
             order: Order = self.order_manager.get_order_by_id(order_id)
             order.deliver_quantity(sku, quantity)
             print("order, sku, quantity :" ,order_id, sku, quantity)
 
-            # Check for SKU Replenishment
-            # sku is sku_id (String)
-            
-            sku, replenished_status = self.pod_manager.is_sku_need_replenished(sku)
-
-            # SKU Replenished Triggered
-            if(replenished_status == True): sku_need_replenished.append(sku)
-    
             assign_order_df = pd.read_csv('assign_order.csv')
             assign_order_df.loc[((assign_order_df['order_id'] == order.order_id) & (assign_order_df['item_id'] == sku)), 'status'] = 1
             assign_order_df.loc[((assign_order_df['order_id'] == order.order_id) & (assign_order_df['item_id'] == sku)), 'order_finished'] = int(self._tick)
@@ -296,14 +291,32 @@ class Inventory(Universe):
                 upsert_order_history(order_id, order_finish_time=self._tick)
         station = self.station_manager.get_station_by_id(job.station_id)
         station.remove_pod(pod.pod_id)
-        
+
+        # Check only recently picked SKUs against current global ROP state
+        sku_need_replenished = []
+        for _, sku, _ in job.orders:
+            sku_out, replenished_status = self.pod_manager.is_sku_need_replenished(sku)
+            if replenished_status and sku_out not in sku_need_replenished:
+                sku_need_replenished.append(sku_out)
+
         pod_info_df.to_csv('pod_info.csv', index=False)
-        # Replenishment baseline
-        # job.is_finished = True
         job.set_job_finish()
         if len(sku_need_replenished) > 0:
-            pod.last_trigger = 'global'
-            return True
+            if USE_OPPORTUNITY_SCORE:
+                # Override 1: stockout guard — force send if any triggering SKU already at 0 globally
+                for sku in sku_need_replenished:
+                    if self.pod_manager.skus_data.get(sku, {}).get('current_global_qty', 1) <= 0:
+                        pod.last_trigger = 'stockout'
+                        return True
+                # Gate: opportunity score
+                score = self.pod_manager.compute_opportunity_score(pod)
+                if score >= REPLENISHMENT_THRESHOLD:
+                    pod.last_trigger = 'global'
+                    return True
+                return False  # defer — re-evaluated on next pick
+            else:
+                pod.last_trigger = 'global'
+                return True
         if pod.check_replenishment_needed():
             pod.last_trigger = 'rop_per_pod'
             return True
@@ -489,26 +502,6 @@ class Inventory(Universe):
                     pod, score = self.find_best_pod(sku_to_quantity, list(sku_to_quantity.keys()), mode="pile_on")
 
                 if not pod:
-                    for sku in sku_to_quantity:
-                        _, needs_replen = self.pod_manager.is_sku_need_replenished(sku)
-                        if not needs_replen:
-                            continue
-                        for candidate_pod in self.pod_manager.pods:
-                            if sku not in candidate_pod.skus:
-                                continue
-                            if not self.pod_manager.is_idle(candidate_pod.pod_id):
-                                continue
-                            station_replenish = self.station_manager.find_available_replenish_station()
-                            if station_replenish is None:
-                                break
-                            self.pod_manager.mark_pod_not_available(candidate_pod)
-                            station_replenish.add_pod(candidate_pod.pod_id)
-                            new_job = RobotJob(candidate_pod.coordinate,
-                                               station_id=station_replenish.station_id,
-                                               pod=candidate_pod)
-                            new_job.add_replenishment_task(candidate_pod)
-                            self.job_queue.append(new_job)
-                            break
                     continue
 
                 job = self.add_picking_task_after_pps(station, pod, sku_to_order_map, sku_to_quantity)
@@ -727,12 +720,15 @@ class Inventory(Universe):
         )
 
         print(f"[DEBUG] ranked_pods (mode={mode}) = {ranked_pods}")
+        # Discard pods that can contribute nothing (all relevant SKUs at qty=0)
+        if ranked_pods[0][1] <= 0:
+            return None, -1
         return ranked_pods[0]
 
     def add_picking_task_after_pps(self, station: Station, pod: Pod, sku_to_list_order_id_and_quantity: dict, sku_to_quantity: dict):
         latest_pod_location = get_pod_location(pod.pod_id)
         if latest_pod_location:
-            pod.pos_x, pod.pos_y = latest_pod_location
+            pod.pos_x, pod.pos_y = int(latest_pod_location[0]), int(latest_pod_location[1])
         job = RobotJob(pod.coordinate, station_id=station.station_id, pod=pod)
         for sku in sku_to_list_order_id_and_quantity:
             # sort based on the least quantity for each sku
