@@ -199,7 +199,7 @@ class Robot(Object):
             # print(f"{self.warehouse.pod_manager.get_pod_by_id(self.job.pod.pod_id).coordinate}")
             # input()
             # raise AssertionError
-            upsert_pod_location(self.job.pod.pod_id, self.job.pod.pos_x, self.job.pod.pos_y)
+            upsert_pod_location(self.job.pod.pod_id, round(self.job.pod.pos_x), round(self.job.pod.pos_y))
             e_li = self.load_mass * self._gravity * self._lift_coef
             self.energy_consumption += e_li
             self.load_mass = 0

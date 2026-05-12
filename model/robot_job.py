@@ -45,7 +45,6 @@ class RobotJob:
 
     def set_job_finish(self):
         self.is_finished = True
-        upsert_pod_location(self.pod.pod_id, self.pod.pos_x, self.pod.pos_y)
 
     def pop_order(self):
         return self.orders.pop(0)

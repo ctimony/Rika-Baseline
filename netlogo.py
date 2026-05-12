@@ -838,7 +838,7 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
         for key, value in skus_data.items():
             writer.writerow([key, value['current_global_qty'], value['max_global_qty'], value['global_inv_level']])
 
-    pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type", "trigger"])
+    pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type", "trigger", "opp_score"])
     pod_info.to_csv("pod_info.csv", index=False)
 
     print(f"Data has been saved to {csv_file}")
@@ -1027,6 +1027,9 @@ def console_tick():
         print("==============================\n")
 
         pd.DataFrame([summary]).to_csv(os.path.join(result_dir, 'summary.csv'), index=False)
+        import shutil
+        if os.path.exists('pod_info.csv'):
+            shutil.copy('pod_info.csv', os.path.join(result_dir, 'pod_info.csv'))
 
         return [next_result[0], universe.total_energy, len(universe.job_queue), universe.stop_and_go,
                 universe.total_turning, next_result[1]]

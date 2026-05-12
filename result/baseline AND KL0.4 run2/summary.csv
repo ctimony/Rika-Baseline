@@ -1,0 +1,2 @@
+max_ticks,ticks,orders_finished,orders_generated,total_energy,stop_and_go,total_turning,peak_job_queue,avg_job_queue,avg_cycle_time,max_cycle_time,order_throughput,total_replenishments,total_picks,replenishment_pick_ratio,total_units_picked,total_pod_visits,pod_utilization
+28800,28800.0,1052,1146,52437151.68,85771,66404,27,18.76,598.82,9203,0.918,214,5898,0.0363,33899,4203,8.0654

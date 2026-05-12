@@ -16,6 +16,7 @@ class Pod(Object):
         self.mass = 0
         self.initial_mass = 0
         self.last_trigger = None
+        self.last_opp_score = None
         self.velocity = 0
         self.acceleration = 0
 
@@ -65,6 +66,18 @@ class Pod(Object):
         if count_below_threshold >= alpha:
             return True
         return False
+
+    def check_pod_index(self, kl: float = 0.5) -> bool:
+        """Layer 2 of AND baseline: Q_j >= KL.
+        Q_j = fraction of slots whose fill ratio (current_qty/limit_qty) < 0.5."""
+        if not self.skus:
+            return False
+        count_below = sum(
+            1 for d in self.skus.values()
+            if d['limit_qty'] > 0 and (d['current_qty'] / d['limit_qty']) < 0.5
+        )
+        q_j = count_below / len(self.skus)
+        return q_j >= kl
 
     def replenish_all_skus(self):
         """Replenish all SKUs by setting each SKU's current quantity to its limit quantity."""

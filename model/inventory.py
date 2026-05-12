@@ -40,8 +40,10 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)  # Let it auto-expand
 
 POD_WMAX = 600.0  # kg — max pod load weight
-USE_OPPORTUNITY_SCORE = True   # Set False to run baseline (immediate replenishment)
-REPLENISHMENT_THRESHOLD = 0.7  # Only used when USE_OPPORTUNITY_SCORE = True
+USE_OPPORTUNITY_SCORE = False  # Set False to run baseline (immediate replenishment)
+REPLENISHMENT_THRESHOLD = 0.4  # Only used when USE_OPPORTUNITY_SCORE = True
+REPLENISHMENT_ALPHA = 1.0      # Not used in multiplicative formula, kept for API compatibility
+BASELINE_KL = 0.9              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline)
 
 class Inventory(Universe):
     dimension = 60
@@ -303,23 +305,31 @@ class Inventory(Universe):
         job.set_job_finish()
         if len(sku_need_replenished) > 0:
             if USE_OPPORTUNITY_SCORE:
-                # Override 1: stockout guard — force send if any triggering SKU already at 0 globally
+                # Gate: opportunity score
+                score = self.pod_manager.compute_opportunity_score(pod, alpha=REPLENISHMENT_ALPHA)
+                pod.last_opp_score = score
+                with open('score_log.csv', 'a') as _f:
+                    _f.write(f"{int(self._tick)},{pod.pod_id},{score:.6f}\n")
+                if score >= REPLENISHMENT_THRESHOLD:
+                    pod.last_trigger = 'opp_score'
+                    return True
+                # Safety net: stockout guard — fire only if OS failed to catch it
                 for sku in sku_need_replenished:
                     if self.pod_manager.skus_data.get(sku, {}).get('current_global_qty', 1) <= 0:
                         pod.last_trigger = 'stockout'
                         return True
-                # Gate: opportunity score
-                score = self.pod_manager.compute_opportunity_score(pod)
-                if score >= REPLENISHMENT_THRESHOLD:
-                    pod.last_trigger = 'global'
-                    return True
                 return False  # defer — re-evaluated on next pick
             else:
-                pod.last_trigger = 'global'
-                return True
-        if pod.check_replenishment_needed():
-            pod.last_trigger = 'rop_per_pod'
-            return True
+                # Baseline AND: layer 1 (global depletion) AND layer 2 (pod index Q_j >= KL)
+                if pod.check_pod_index(BASELINE_KL):
+                    pod.last_trigger = 'global'
+                    return True
+                # Stockout override — fire if any SKU fully depleted globally
+                for sku in sku_need_replenished:
+                    if self.pod_manager.skus_data.get(sku, {}).get('current_global_qty', 1) <= 0:
+                        pod.last_trigger = 'stockout'
+                        return True
+                return False
         return False
     
     def finish_replenishment_task(self, job: RobotJob):
@@ -336,7 +346,8 @@ class Inventory(Universe):
                 "order_id": -999,
                 "processed_time": int(self._tick),
                 "task_type": 2,
-                "trigger": pod.last_trigger
+                "trigger": pod.last_trigger,
+                "opp_score": pod.last_opp_score
             }
             
         new_row_df = pd.DataFrame([new_row])
