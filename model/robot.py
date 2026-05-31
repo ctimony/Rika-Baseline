@@ -494,6 +494,8 @@ class Robot(Object):
         # print(f"Masuk kesini per modulo 30 detik {self.universe._tick}")
         if self.idle_time <= 50:
             return False
+        if self.idle_time > 500:
+            return True  # force reroute any state to break permanent deadlock
         if self.current_state == "delivering_pod" and self.idle_time <= 200:
             return False
 
@@ -502,8 +504,9 @@ class Robot(Object):
 
             if self.current_state == "station_processing" and station.has_route_changed(self.robotName()):
                 return True
-            else:
-                return False
+            if self.current_state == "delivering_pod" and self.idle_time > 200:
+                return True
+            return False
 
         # delivering_pod robots stuck >200 ticks always reroute to break deadlocks
         if self.current_state == "delivering_pod":
@@ -668,10 +671,10 @@ class Robot(Object):
             rotation_deg = 180
         rotation = np.radians(rotation_deg)
         trot = self.delay_per_task * self.universe.tick_to_second  # 1.5 s
-        # Paper Eq. 14: E_krot = (1/6) * mR * (l^2 + w^2) * theta^2 / trot^2  — robot mass only
-        e_krot = (1/6) * self.mass * (self._length**2 + self._robot_width**2) * (rotation**2 / trot**2)
-        # Paper Eq. 15: E_frot = mR * g * μr * r * theta  — robot mass only
-        e_frot = self.mass * self._gravity * self._friction * self._robot_radius * rotation
+        # Thesis Eq. 3.35: E_krot = (1/6) * (mA+mp) * (l^2 + w^2) * theta^2 / trot^2  — total mass: pod rides with robot during turns
+        e_krot = (1/6) * (self.mass + self.load_mass) * (self._length**2 + self._robot_width**2) * (rotation**2 / trot**2)
+        # Thesis Eq. 3.36: E_frot = (mA+mp) * g * kr * r * theta  — total mass: pod rides with robot during turns
+        e_frot = (self.mass + self.load_mass) * self._gravity * self._friction * self._robot_radius * rotation
         e_rot = e_krot + e_frot
         self.energy_consumption += e_rot
         self.turning += 1

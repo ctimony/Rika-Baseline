@@ -1,0 +1,11 @@
+Raw orders: 321,314
+After drop nulls: 321,314 (removed 0)
+After consolidate duplicates: 308,980 (merged 12,334 dupes)
+After item_volume > 60,000 filter: 274,632 (removed 34,348)
+After qty > max_qty_per_slot filter: 268,748 (removed 5,884)
+After clean_skus_pod3 filter: 268,748 (removed 0)
+
+Final clean orders: 268,748
+Unique orders: 53,492
+Unique items: 7,066
+Total removed: 52,566 (16.4%)

@@ -268,10 +268,10 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     config_orders(
         initial_order=100,
-        total_requested_item=3000,
-        items_orders_class_configuration={"A": 0.79, "B": 0.17, "C": 0.04},
+        total_requested_item=4000,
+        items_orders_class_configuration={"A": 0.8, "B": 0.15, "C": 0.05},
         quantity_range=[1, 12],
-        order_cycle_time=150,
+        order_cycle_time=120,
         order_period_time=8,
         order_start_arrival_time=0,
         date=1,
@@ -777,7 +777,7 @@ def generate_rop_summary():
 def assign_skus_to_pods(pod_manager):
     # Check if pods.csv exists in the current directory
     if not os.path.exists('pods.csv'):
-        PodGenerator(pod_types=[3], pod_num=[377], total_sku=3000,
+        PodGenerator(pod_types=[3], pod_num=[421], total_sku=4000,
                       items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
@@ -840,6 +840,9 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
 
     pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type", "trigger", "opp_score"])
     pod_info.to_csv("pod_info.csv", index=False)
+
+    with open('score_log.csv', 'w') as _f:
+        _f.write("tick,pod_id,pod_gap,urgency_max\n")
 
     print(f"Data has been saved to {csv_file}")
     df = pd.read_csv(csv_file)
@@ -990,6 +993,9 @@ def console_tick():
         avg_jq = round(tick_df['job_queue_len'].mean(), 2)
         throughput = round(orders_finished / orders_generated, 4) if orders_generated > 0 else 0
 
+        skus_replenished = universe.skus_replenished_count
+        trip_efficiency = round(skus_replenished / total_replenishments) if total_replenishments > 0 else 0
+
         summary = {
             'max_ticks': max_ticks,
             'ticks': round(universe._tick, 2),
@@ -1009,6 +1015,8 @@ def console_tick():
             'total_units_picked': total_units_picked,
             'total_pod_visits': total_pod_visits,
             'pod_utilization': pod_utilization,
+            'skus_replenished': skus_replenished,
+            'trip_efficiency': trip_efficiency,
         }
 
         print("\n===== SIMULATION RESULTS =====")
@@ -1022,6 +1030,7 @@ def console_tick():
         print(f"  Max cycle time:    {max_cycle}s")
         print(f"  Order throughput:  {throughput} ({orders_generated} generated)")
         print(f"  Replen/pick ratio: {reple_pick_ratio} ({total_replenishments}R / {total_picks}P)")
+        print(f"  Trip efficiency:   {trip_efficiency} SKUs/trip ({skus_replenished} SKUs / {total_replenishments} trips)")
         print(f"  Pod utilization:   {pod_utilization} ({total_units_picked} units / {total_pod_visits} visits)")
         print(f"  Results saved to:  {result_dir}")
         print("==============================\n")

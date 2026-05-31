@@ -39,11 +39,10 @@ pd.set_option('display.max_colwidth', None)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)  # Let it auto-expand
 
-POD_WMAX = 600.0  # kg — max pod load weight
-USE_OPPORTUNITY_SCORE = False  # Set False to run baseline (immediate replenishment)
-REPLENISHMENT_THRESHOLD = 0.4  # Only used when USE_OPPORTUNITY_SCORE = True
-REPLENISHMENT_ALPHA = 1.0      # Not used in multiplicative formula, kept for API compatibility
-BASELINE_KL = 0.9              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline)
+USE_OPPORTUNITY_SCORE = True     # True = Proactive ORS (300 ticks), False = baseline AND gate with pod index
+REPLENISHMENT_THETA = 0.4      # ORS v8: effective threshold = THETA * (1 - urgency_max)
+BASELINE_KL = 0.5              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline)
+BASELINE_UL = {'A': 0.4, 'B': 0.5, 'C': 0.6}  # Layer 1 utilization threshold per ABC class
 
 class Inventory(Universe):
     dimension = 60
@@ -93,7 +92,8 @@ class Inventory(Universe):
         self.pps_demand = False
 
         self.priority_order = False
-
+        self._stockout_skus: set = set()  # rebuilt every tick
+        self.skus_replenished_count = 0  # total SKU slots refilled across all replenishment trips
 
         if self.poa_second:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -125,7 +125,17 @@ class Inventory(Universe):
 
         # Reset movement tracking
         self.movement_channel = {}
-        
+
+        # Proactive stockout override (baseline only) — scan every 300 ticks
+        if not USE_OPPORTUNITY_SCORE:
+            if int(self._tick) % 300 == 0:
+                self._stockout_skus = {
+                    sku for sku, data in self.pod_manager.skus_data.items()
+                    if data.get('current_global_qty', 1) == 0
+                }
+            if self._stockout_skus:
+                self._dispatch_stockout_pods()
+
         # Process orders at scheduled intervals
         if int(self._tick) == self.next_process_tick:
             print(f"Processing orders at tick {self._tick}")
@@ -303,41 +313,45 @@ class Inventory(Universe):
 
         pod_info_df.to_csv('pod_info.csv', index=False)
         job.set_job_finish()
-        if len(sku_need_replenished) > 0:
-            if USE_OPPORTUNITY_SCORE:
-                # Gate: opportunity score
-                score = self.pod_manager.compute_opportunity_score(pod, alpha=REPLENISHMENT_ALPHA)
-                pod.last_opp_score = score
-                with open('score_log.csv', 'a') as _f:
-                    _f.write(f"{int(self._tick)},{pod.pod_id},{score:.6f}\n")
-                if score >= REPLENISHMENT_THRESHOLD:
-                    pod.last_trigger = 'opp_score'
-                    return True
-                # Safety net: stockout guard — fire only if OS failed to catch it
-                for sku in sku_need_replenished:
-                    if self.pod_manager.skus_data.get(sku, {}).get('current_global_qty', 1) <= 0:
-                        pod.last_trigger = 'stockout'
-                        return True
-                return False  # defer — re-evaluated on next pick
-            else:
-                # Baseline AND: layer 1 (global depletion) AND layer 2 (pod index Q_j >= KL)
-                if pod.check_pod_index(BASELINE_KL):
-                    pod.last_trigger = 'global'
-                    return True
-                # Stockout override — fire if any SKU fully depleted globally
-                for sku in sku_need_replenished:
-                    if self.pod_manager.skus_data.get(sku, {}).get('current_global_qty', 1) <= 0:
-                        pod.last_trigger = 'stockout'
-                        return True
+        if USE_OPPORTUNITY_SCORE:
+            return self._dispatch_proactive_replenishment(extra_pod=pod)
+        else:
+            # Baseline AND:
+            # Layer 1 — any SKU in this pod has current_global / max_global < UL (per class)
+            flagged = []
+            for sku in pod.skus:
+                data = self.pod_manager.skus_data.get(sku)
+                if data is None:
+                    continue
+                max_global = data.get('max_global_qty', 0)
+                if max_global <= 0:
+                    continue
+                current_global = data.get('current_global_qty', 0)
+                item_class = data.get('item_class', 'C')
+                ul = BASELINE_UL.get(item_class, BASELINE_UL['C'])
+                if current_global / max_global < ul:
+                    flagged.append(sku)
+            if len(flagged) == 0:
                 return False
+            # Layer 2 — pod index Q_j >= KL (fraction of slots below 50% capacity)
+            if pod.check_pod_index(BASELINE_KL):
+                pod.last_trigger = 'global'
+                return True
+            return False
         return False
     
     def finish_replenishment_task(self, job: RobotJob):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
-        replenished = pod.replenish_all_skus_capped(POD_WMAX)
-        for sku, qty_added in replenished.items():
-            self.pod_manager.restore_sku_data(sku, qty_added)
+        qty_before = {sku: d['current_qty'] for sku, d in pod.skus.items()}
+        pod.replenish_all_skus()
+        skus_filled_this_trip = 0
+        for sku, d in pod.skus.items():
+            qty_added = d['current_qty'] - qty_before.get(sku, 0)
+            if qty_added > 0:
+                self.pod_manager.restore_sku_data(sku, qty_added)
+                skus_filled_this_trip += 1
+        self.skus_replenished_count += skus_filled_this_trip
         pod_info_df = pd.read_csv('pod_info.csv')
         new_row = {
                 "pod_id": pod.pod_id,
@@ -358,6 +372,185 @@ class Inventory(Universe):
         station = self.station_manager.get_station_by_id(job.station_id)
         station.remove_pod(pod.pod_id)
         return False
+
+    def _compute_pending_demand(self) -> dict:
+        """
+        Hitung total units per SKU yang masih dibutuhkan oleh orders yang sudah
+        di-assign ke picking station tapi belum di-deliver.
+        Ini adalah "committed demand" — sudah pasti akan mengurangi stok segera.
+        """
+        pending = {}
+        for order in self.order_manager.unfinished_orders:
+            if order.station_id is None:
+                continue
+            for sku, details in order.skus.items():
+                remaining = details['total_quantity'] - details['quantity_delivered']
+                if remaining > 0:
+                    pending[sku] = pending.get(sku, 0) + remaining
+        return pending
+
+    def _dispatch_stockout_pods(self):
+        """Per scan interval: for each stockout SKU, dispatch at most 1 pod if no pod already dispatched for that SKU."""
+        skus_to_remove = set()
+        for sku_id in list(self._stockout_skus):
+            # Skip if any pod for this SKU is already non-idle (already on the way to replenishment)
+            pods_for_sku = self.pod_manager.sku_to_pods.get(sku_id) or []
+            already_en_route = any(
+                p is not None
+                and not self.pod_manager.is_idle(p.pod_id)
+                and getattr(p, 'last_trigger', None) == 'stockout'
+                for p in pods_for_sku
+            )
+            if already_en_route:
+                skus_to_remove.add(sku_id)
+                continue
+            for pod in pods_for_sku:
+                if pod is None or not self.pod_manager.is_idle(pod.pod_id):
+                    continue
+                if sku_id not in pod.skus or pod.skus[sku_id]['current_qty'] >= pod.skus[sku_id]['limit_qty']:
+                    continue
+                station_replenish = self.station_manager.find_available_replenish_station()
+                if station_replenish is None:
+                    return  # no station capacity — stop entirely
+                nearest_robot = None
+                current_distance = float('inf')
+                for o in self.get_movable_objects():
+                    if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                        dist = calculateDistance(o.pos_x, o.pos_y, pod.pos_x, pod.pos_y)
+                        if dist < current_distance:
+                            nearest_robot = o
+                            current_distance = dist
+                if nearest_robot is None:
+                    break  # no idle robot — try next SKU
+                latest_pod_location = get_pod_location(pod.pod_id)
+                if latest_pod_location:
+                    pod.pos_x, pod.pos_y = int(latest_pod_location[0]), int(latest_pod_location[1])
+                station_replenish.add_pod(pod.pod_id)
+                new_job = RobotJob(pod.coordinate, station_id=station_replenish.station_id, pod=pod)
+                new_job.add_replenishment_task(pod)
+                pod.last_trigger = 'stockout'
+                nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+                self.pod_manager.mark_pod_not_available(pod)
+                skus_to_remove.add(sku_id)  # 1 pod dispatched, done for this SKU
+                break
+        self._stockout_skus -= skus_to_remove
+
+    def _compute_pod_score(self, pod, critical_skus) -> tuple:
+        """Compute (pod_gap, urgency_max) for a pod given current critical SKUs."""
+        total_current = sum(
+            float(s.get('current_qty', 0)) for s in pod.skus.values() if float(s.get('limit_qty', 0)) > 0
+        )
+        total_limit = sum(
+            float(s.get('limit_qty', 0)) for s in pod.skus.values() if float(s.get('limit_qty', 0)) > 0
+        )
+        if total_limit <= 0:
+            return 0.0, 0.0
+        pod_gap = 1.0 - (total_current / total_limit)
+        urgency_max = 0.0
+        for s_id in pod.skus:
+            if s_id not in critical_skus:
+                continue
+            data = self.pod_manager.skus_data.get(s_id, {})
+            rop = data.get('rop_global', 0)
+            if rop <= 0:
+                continue
+            current_global = data.get('current_global_qty', 0)
+            urgency = max(0.0, min(1.0, (rop - current_global) / rop))
+            if urgency > urgency_max:
+                urgency_max = urgency
+        return pod_gap, urgency_max
+
+    def _dispatch_proactive_replenishment(self, extra_pod=None):
+        """
+        Post-pick ORS: triggered after each pick event when any SKU is below ROP.
+        Per critical SKU, finds best pod (highest pod_gap, ORS v8 threshold) from
+        all idle pods + extra_pod (the pod that just finished picking).
+        Returns True if extra_pod was selected for replenishment, False otherwise.
+        """
+        critical_skus = {
+            sku for sku, data in self.pod_manager.skus_data.items()
+            if data.get('current_global_qty', 1) <= data.get('rop_global', 0)
+        }
+        if not critical_skus:
+            return False
+
+        dispatched_pods = set()
+        extra_pod_selected = False
+
+        for sku_id in critical_skus:
+            best_pod = None
+            best_score = -1.0
+            best_urgency = 0.0
+
+            # Build candidate list: idle pods + extra_pod
+            candidates = list(self.pod_manager.sku_to_pods.get(sku_id) or [])
+            if extra_pod is not None and extra_pod not in candidates and sku_id in extra_pod.skus:
+                candidates.append(extra_pod)
+
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                if candidate.pod_id in dispatched_pods or candidate.need_replenishment:
+                    continue
+                # extra_pod is not idle yet — allow it; all others must be idle
+                if candidate is not extra_pod and not self.pod_manager.is_idle(candidate.pod_id):
+                    continue
+                if sku_id not in candidate.skus:
+                    continue
+                if candidate.skus[sku_id]['current_qty'] >= candidate.skus[sku_id]['limit_qty']:
+                    continue
+
+                pod_gap, urgency_max = self._compute_pod_score(candidate, critical_skus)
+                effective_threshold = REPLENISHMENT_THETA * (1.0 - urgency_max)
+                if pod_gap < effective_threshold:
+                    continue
+                if pod_gap > best_score:
+                    best_score = pod_gap
+                    best_urgency = urgency_max
+                    best_pod = candidate
+
+            if best_pod is None:
+                continue
+
+            # Log score
+            best_pod.last_opp_score = best_score
+            with open('score_log.csv', 'a') as _f:
+                _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_score:.6f},{best_urgency:.6f}\n")
+            best_pod.last_trigger = 'opp_score'
+
+            if best_pod is extra_pod:
+                # extra_pod selected — caller (finish_task_in_job) handles dispatch via return True
+                extra_pod_selected = True
+                dispatched_pods.add(best_pod.pod_id)
+                continue
+
+            # Idle pod — dispatch immediately
+            station_replenish = self.station_manager.find_available_replenish_station()
+            if station_replenish is None:
+                break
+
+            nearest_robot = None
+            current_distance = float('inf')
+            for o in self.get_movable_objects():
+                if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                    dist = calculateDistance(o.pos_x, o.pos_y, best_pod.pos_x, best_pod.pos_y)
+                    if dist < current_distance:
+                        nearest_robot = o
+                        current_distance = dist
+            if nearest_robot is None:
+                continue
+
+            latest_pod_location = get_pod_location(best_pod.pod_id)
+            if latest_pod_location:
+                best_pod.pos_x, best_pod.pos_y = int(latest_pod_location[0]), int(latest_pod_location[1])
+            station_replenish.add_pod(best_pod.pod_id)
+            new_job = RobotJob(best_pod.coordinate, station_id=station_replenish.station_id, pod=best_pod)
+            new_job.add_replenishment_task(best_pod)
+            nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+            self.pod_manager.mark_pod_not_available(best_pod)
+            dispatched_pods.add(best_pod.pod_id)
+
+        return extra_pod_selected
 
     def insert_finished_order_to_csv(self, order: Order):
         header = ["order_id", "order_arrival", "process_start_time", "order_complete_time", "station_id"]

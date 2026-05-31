@@ -97,63 +97,123 @@ class PodManager:
             # Put in the result of the sum probability of each pod to the stock_out_probability_of_each_pod
         # Return the pod.pod_id with the highest value of stock_out_probability_of_each_pod
         
-    def compute_opportunity_score(self, pod, alpha: float = 1.0) -> float:
+    def compute_fa_opportunity_score(self, pod, picked_skus: list, pending_demand: dict) -> tuple:
         """
-        Opportunity Score — multiplicative form, guaranteed in [0,1]:
-            sku_score = w_class × scarcity × (1 - redundancy) × space_ratio
-            OS_pod    = mean(sku_score) over depleted SKUs (space_ratio > 0)
+        FA-ORS: Future-Aware Opportunity Score.
 
-        scarcity:        1 - (current_global / max_global)  — global stock depletion
-        (1-redundancy):  1 - n_active_other / max(total_pods-1, 1)  — lack of alternatives
-        space_ratio:     1 - (pod_qty / limit_qty)  — how empty this pod slot is
+        Extends ORS v8 by adjusting urgency with pending demand from orders already
+        assigned to picking stations but not yet delivered. Analogous to thesis POA:
+        considers committed-but-unrealised state rather than snapshot only.
 
-        Redundancy penalty is implicit: high redundancy → (1-redundancy) low → score low → defer.
-        OS in [0,1] by construction — T is directly interpretable as urgency threshold.
-        Triggered only when at least one picked SKU passes layer 1 (current_global <= rop_global).
+        projected_qty(sku) = max(0, current_global_qty - pending_demand[sku])
+        fa_urgency(sku)    = clamp((ROP - projected_qty) / ROP, 0, 1)
+        fa_urgency_max     = max fa_urgency across picked_skus with ROP > 0
+
+        pod_gap = 1 - (Σ current_qty / Σ limit_qty) across all slots in pod
+
+        Returns: (pod_gap, urgency_max, fa_urgency_max)
+            urgency_max    — snapshot urgency (for logging/comparison)
+            fa_urgency_max — future-aware urgency (used for effective threshold)
         """
-        triggering_skus = [
-            sku for sku in pod.skus
-            if sku in self.skus_data
-            and self.skus_data[sku]['current_global_qty'] <= self.skus_data[sku]['rop_global']
-            and pod.skus[sku]['current_qty'] < pod.skus[sku]['limit_qty']
-        ]
+        skus_to_check = picked_skus if picked_skus else list(pod.skus.keys())
+        urgency_max = 0.0
+        fa_urgency_max = 0.0
+        n_critical = 0
 
-        if not triggering_skus:
-            return 0.0
-
-        scores = []
-        for sku, slot in pod.skus.items():
-            if sku not in self.skus_data:
+        for sku_id in skus_to_check:
+            if sku_id not in pod.skus:
                 continue
-            data = self.skus_data[sku]
-            max_global = max(float(data.get('max_global_qty', 1)), 1)
-            current_global = float(data.get('current_global_qty', 0))
-            limit_qty = float(slot.get('limit_qty', 1))
-            pod_qty = float(slot.get('current_qty', 0))
-            if limit_qty <= 0:
+            data = self.skus_data.get(sku_id)
+            if data is None:
                 continue
-
-            space_ratio = 1.0 - (pod_qty / limit_qty)
-            if space_ratio <= 0:
+            rop = data.get('rop_global', 0)
+            if rop <= 0:
                 continue
+            current_global = data.get('current_global_qty', 0)
 
-            scarcity = 1.0 - (current_global / max_global)
+            # Snapshot urgency (for logging)
+            urgency = max(0.0, min(1.0, (rop - current_global) / rop))
+            if urgency > urgency_max:
+                urgency_max = urgency
 
-            pods_for_sku = self.sku_to_pods.get(sku, [])
-            total_pods = len(pods_for_sku)
-            n_active = sum(
-                1 for p in pods_for_sku
-                if p is not pod
-                and float(p.skus.get(sku, {}).get('current_qty', 0)) > 0
-            )
-            redundancy = n_active / max(total_pods - 1, 1)
+            # Future-aware: subtract units already committed by active station orders
+            projected_qty = max(0.0, current_global - pending_demand.get(sku_id, 0))
+            fa_urgency = max(0.0, min(1.0, (rop - projected_qty) / rop))
+            if fa_urgency > fa_urgency_max:
+                fa_urgency_max = fa_urgency
 
-            sku_score = scarcity * (1.0 - redundancy) * space_ratio
-            scores.append(sku_score)
+            if urgency > 0 or fa_urgency > 0:
+                n_critical += 1
 
-        if not scores:
-            return 0.0
-        return sum(scores) / len(scores)
+        if n_critical == 0:
+            return 0.0, 0.0, 0.0
+
+        total_current = 0.0
+        total_limit = 0.0
+        for slot in pod.skus.values():
+            lq = float(slot.get('limit_qty', 0))
+            if lq > 0:
+                total_current += float(slot.get('current_qty', 0))
+                total_limit += lq
+
+        if total_limit <= 0:
+            return 0.0, 0.0, 0.0
+
+        pod_gap = 1.0 - (total_current / total_limit)
+        return pod_gap, urgency_max, fa_urgency_max
+
+    def compute_opportunity_score(self, pod, picking_stations: list = None, picked_skus: list = None) -> tuple:
+        """
+        ORS v8 — reactive, post-picking.
+        Layer 1 (gate) already checked in inventory.py before this is called.
+
+        urgency_max = max urgency across critical SKUs in picked_skus
+            urgency_i = clamp((ROP_i - current_global_i) / ROP_i, 0, 1)
+
+        pod_gap = 1 - (Σ current_qty_i / Σ limit_qty_i) across all SKUs in pod
+            → measures how empty the pod is overall (joint replenishment potential)
+
+        Trigger condition (evaluated in inventory.py):
+            pod_gap >= theta × (1 - urgency_max)
+            → higher urgency lowers the effective threshold, making it easier to trigger
+
+        Returns: (pod_gap, urgency_max)
+        """
+        skus_to_check = picked_skus if picked_skus else list(pod.skus.keys())
+        urgency_max = 0.0
+        n_critical = 0
+        for sku_id in skus_to_check:
+            if sku_id not in pod.skus:
+                continue
+            rop = self.skus_data.get(sku_id, {}).get('rop_global', None)
+            if rop is None or rop <= 0:
+                continue
+            if sku_id not in self.skus_data:
+                continue
+            current_global = self.skus_data[sku_id].get('current_global_qty', 0)
+            if current_global > rop:
+                continue
+            urgency = max(0.0, min(1.0, (rop - current_global) / rop))
+            if urgency > urgency_max:
+                urgency_max = urgency
+            n_critical += 1
+
+        if n_critical == 0:
+            return 0.0, 0
+
+        total_current = 0.0
+        total_limit = 0.0
+        for slot in pod.skus.values():
+            lq = float(slot.get('limit_qty', 0))
+            if lq > 0:
+                total_current += float(slot.get('current_qty', 0))
+                total_limit += lq
+
+        if total_limit <= 0:
+            return 0.0, 0
+
+        pod_gap = 1.0 - (total_current / total_limit)
+        return pod_gap, urgency_max
 
     def has_other_idle_pod_with_qty(self, sku, excluding_pod) -> bool:
         """Return True if any idle pod OTHER than excluding_pod has qty > 0 for this SKU."""
