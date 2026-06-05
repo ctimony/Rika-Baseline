@@ -32,7 +32,7 @@ class PodManager:
             self.sku_to_pods[sku] = []
         self.sku_to_pods[sku].append(pod)
 
-    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0, item_class='C', n_slots=1):
+    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0, item_class='C', n_slots=1, demand_rate=0.0):
         sku_id = sku
 
         if sku_id not in self.skus_data:
@@ -44,6 +44,7 @@ class PodManager:
                 'rop_global': rop_global,
                 'item_class': item_class,
                 'n_slots': n_slots,
+                'mean_daily_demand': demand_rate,
             }
         else:
             self.skus_data[sku_id]['current_global_qty'] += current_qty

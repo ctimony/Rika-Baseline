@@ -16,7 +16,7 @@ class Layout(object):
         self.order_replenishment_total = 1
         self.horizontal_direction_switch = False
         self.vertical_direction_switch = False
-        self.total_pods_active = 421 # Number of pods
+        self.total_pods_active = 468 # Number of pods (raised from 421: new Z_MAP needs ~468 pods for 4000 SKU; grid physical max = 500)
         self.total_charging_stations = 10
 
     def generate(self):

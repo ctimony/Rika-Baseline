@@ -342,13 +342,12 @@ class PodGenerator:
                 if max_fit <= 0:
                     max_fit = 1
                 slots_needed = int(np.ceil(row["item_initial_quantity_inventory"] / max_fit))
-                # Pick one empty slot per pod, one pod per slot_needed
-                # groupby keeps original pods index; take the first empty slot per pod
-                one_per_pod_idx = empty_df.groupby("pod_id").apply(lambda g: g.index[0], include_groups=False).tolist()
-                if len(one_per_pod_idx) >= slots_needed:
-                    idxs = one_per_pod_idx[:slots_needed]
-                else:
-                    idxs = one_per_pod_idx
+                # Mop-up is the overflow phase: fill ANY remaining empty slots to
+                # satisfy slots_needed, including multiple slots in the same pod.
+                # (The scattered-storage "one slot per pod" rule applies to the main
+                # proportional allocation in Phase 3; here the priority is to place
+                # every item and leave no empty slots stranded.)
+                idxs = empty_df.index.tolist()[:slots_needed]
                 if not idxs:
                     print(f"    WARNING: Not enough slots for item_id {int(row['item_id'])} (need {slots_needed}, have 0)")
                     continue
@@ -362,7 +361,10 @@ class PodGenerator:
                 print(f"    Mop-up: item_id {int(row['item_id'])} (Class {row['item_class']}) placed in {len(idxs)} slots")
 
         # ── Phase 5: Finalize and save ────────────────────────────────────────
-        pods[["item", "qty", "max_qty"]] = pods[["item", "qty", "max_qty"]].fillna(0).astype(int)
+        # Empty slots: item = -1 (NOT 0, which would collide with the real item_id 0);
+        # qty/max_qty = 0. This makes empty slots unambiguously identifiable.
+        pods["item"] = pods["item"].fillna(-1).astype(int)
+        pods[["qty", "max_qty"]] = pods[["qty", "max_qty"]].fillna(0).astype(int)
         pods = pods.sort_values(["pod_id", "slot_sequence"]).reset_index(drop=True)
         pods["cumulative_pod_weight"] = pods.groupby("pod_id")["total_item_weight"].cumsum().round(3)
 

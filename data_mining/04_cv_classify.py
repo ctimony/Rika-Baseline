@@ -1,22 +1,31 @@
 """
 04_cv_classify.py
 =================
-Classifies SKUs by demand pattern and CV class.
+Classifies each SKU into a demand pattern using the Syntetos-Boylan-Croston
+(SBC) categorisation scheme.
 
-Demand pattern (Syntetos, Boylan & Croston, 2005):
-  ADI = N_days / n_nonzero_days
-  CV² = (std / mean)² of nonzero demand days only
-  Cutoffs: ADI=1.32, CV²=0.49
-    Smooth       : ADI < 1.32, CV² < 0.49
-    Erratic      : ADI < 1.32, CV² >= 0.49
-    Intermittent : ADI >= 1.32, CV² < 0.49
-    Lumpy        : ADI >= 1.32, CV² >= 0.49
+Reference:
+  Syntetos, A.A., Boylan, J.E., & Croston, J.D. (2005).
+  "On the categorization of demand patterns."
+  Journal of the Operational Research Society, 56(5), 495-503.
 
-CV class (thesis):
-  CV = std_daily / mean_daily  (all days including zeros)
-  0 : CV <= 0.5   (Stable)
-  1 : 0.5 < CV <= 1.0  (Volatile)
-  2 : CV > 1.0   (Intermittent)
+Two dimensions are computed per SKU:
+  ADI = N / N_p
+        Average Demand Interval. N = total observation periods (here, 1 period
+        = 1 day); N_p = number of periods in which demand occurred.
+  CV² = (std / mean)² of demand SIZES on demand-occurring periods ONLY
+        (zero-demand days are excluded, per the SBC definition: the squared
+        coefficient of variation of demand sizes "when demand occurs").
+
+Theoretically derived cutoffs (SBC 2005, Fig. 3 / Table 1; insensitive to the
+smoothing constant): ADI = 1.32, CV² = 0.49.
+
+    Smooth       : ADI < 1.32, CV² < 0.49   (frequent, stable quantities)
+    Erratic      : ADI < 1.32, CV² >= 0.49  (frequent, variable quantities)
+    Intermittent : ADI >= 1.32, CV² < 0.49  (sporadic, stable quantities)
+    Lumpy        : ADI >= 1.32, CV² >= 0.49  (sporadic, variable quantities)
+
+The ABC class (from 03_abc_skus.csv, K-Means k=3) is merged in for reference.
 
 Output: data_mining/output/04_cv_classification.csv
 """
@@ -73,7 +82,10 @@ def main():
         nonzero = vals[vals > 0]
         n_nz   = len(nonzero)
 
-        # Mean and std over all days (including zeros) — for CV class
+        # Mean and std over all days (including zeros).
+        # NOTE: cv / cv_class below are legacy (single-CV scheme); retained in
+        # the CSV for backward compatibility but NOT used for classification.
+        # The demand pattern (SBC) is the authoritative classification.
         mean_d = vals.mean()
         std_d  = vals.std(ddof=1) if N > 1 else 0.0
         cv     = (std_d / mean_d) if mean_d > 0 else 0.0

@@ -3,23 +3,31 @@
 ============================
 Rebuilds items_dictionary.csv from clean pipeline outputs.
 
-Formula (Minimum Inventory Level — Equation 10):
-  initial_qty = mean_daily_demand * cov_days
-                + Z * std_daily_demand * sqrt(cov_days)
+Initial inventory formula:
+  initial_qty = mean_daily_demand * cov_days + Z * std_daily_demand * sqrt(cov_days)
 
-Coverage days per demand pattern:
-  smooth / erratic  : 1 day
-  intermittent      : 3 days
-  lumpy             : 4 days
+Coverage days per ABC × demand pattern:
+  A: smooth/erratic=1, intermittent=3, lumpy=4
+  B: smooth/erratic=2, intermittent=4, lumpy=5
+  C: smooth/erratic=3, intermittent=5, lumpy=5
 
 Z score per ABC × CV class:
   A × CV0 : 2.33 (99%)    B × CV0 : 1.64 (95%)    C × CV0 : 1.28 (90%)
-  A × CV1 : 1.64 (95%)    B × CV1 : 1.28 (90%)    C × CV1 : 1.04 (85%)
-  A × CV2 : 1.28 (90%)    B × CV2 : 1.04 (85%)    C × CV2 : 0.84 (80%)
+  A × CV1 : 1.64 (95%)    B × CV1 : 1.64 (95%)    C × CV1 : 1.28 (90%)
+  A × CV2 : 1.28 (90%)    B × CV2 : 1.28 (90%)    C × CV2 : 1.28 (90%)
 
-ROP (lead time = 1/8 day = 1 shift):
-  rop = mean_daily_demand * (1/8) + Z * std_daily_demand * sqrt(1/8)
-  minimum 1
+ROP — distribution-fitting by demand pattern (lead time L = 1/8 day):
+  ROP = F⁻¹(service level), with lead-time demand μ(L)=μ·L, σ²(L)=σ²·L
+
+  Smooth / Erratic — Normal (Pinçe et al. 2021 §3.1; Syntetos & Boylan 2005):
+    rop = μ·L + Z · σ·sqrt(L)
+
+  Intermittent / Lumpy — count distribution (Pinçe et al. 2021 §3.1.3):
+    Negative Binomial when var(L) > mean(L)  [overdispersed — "best option ...
+      as it allows for greater variability"]; method of moments for (r, p).
+    Poisson when var(L) ≤ mean(L)  [equidispersed, near-constant demand size].
+
+  minimum ROP = 1
 
 Inputs:
   data_mining/output/01_clean_skus_pod3.csv
@@ -31,7 +39,7 @@ Output: items_dictionary.csv  (project root)
 import os
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import norm, nbinom, poisson
 
 ROOT      = os.path.dirname(os.path.abspath(__file__))
 SKUS_PATH = os.path.join(ROOT, "output", "01_clean_skus_pod3.csv")
@@ -55,19 +63,23 @@ COVERAGE_DAYS = {
     ("C", "lumpy"):        4,
 }
 
+# Service level (Z) is a function of ABC class ONLY — a proxy for item
+# criticality (A items most critical → highest availability), per standard
+# inventory practice (Silver, Pyke & Peterson 1998). It is NOT a function of
+# cv_class: the legacy cv (total CV including zero-demand days) is misleading for
+# intermittent SKUs (high cv from sparsity, not size variability). Demand-size
+# variability (CV²) instead enters through the lead-time demand DISTRIBUTION
+# (Poisson vs Negative Binomial, chosen by dispersion), per Boylan & Syntetos.
+#   A: 99% service level (Z = 2.3263)
+#   B: 95% service level (Z = 1.6449)
+#   C: 90% service level (Z = 1.2816)
 Z_MAP = {
-    ("A", 0): norm.ppf(0.99),  # 2.3263
-    ("A", 1): norm.ppf(0.95),  # 1.6449
-    ("A", 2): norm.ppf(0.90),  # 1.2816
-    ("B", 0): norm.ppf(0.95),  # 1.6449
-    ("B", 1): norm.ppf(0.95),  # 1.6449
-    ("B", 2): norm.ppf(0.90),  # 1.2816
-    ("C", 0): norm.ppf(0.90),  # 1.2816
-    ("C", 1): norm.ppf(0.90),  # 1.2816
-    ("C", 2): norm.ppf(0.90),  # 1.2816
+    "A": norm.ppf(0.99),  # 2.3263
+    "B": norm.ppf(0.95),  # 1.6449
+    "C": norm.ppf(0.90),  # 1.2816
 }
 
-LEAD_TIME_ROP = 1 / 8  # 1 shift
+LEAD_TIME_ROP = 0.5 / 8  # 1 shift-hour (default)
 
 
 def main():
@@ -118,7 +130,7 @@ def main():
         cv_c  = int(row["cv_class"])
         pat   = str(row["demand_pattern"])
         cov   = COVERAGE_DAYS.get((cls, pat), COVERAGE_DAYS.get(("C", pat), 4))
-        z     = Z_MAP.get((cls, cv_c), norm.ppf(0.80))
+        z     = Z_MAP.get(cls, Z_MAP["C"])  # fallback: unclassified -> C (90%), consistent with fillna("C")
         if mu <= 0:
             return 1
         rop_1day = mu * 1.0 + z * sigma * np.sqrt(1.0)
@@ -128,15 +140,49 @@ def main():
     df["item_initial_quantity_inventory"] = df.apply(compute_initial_qty, axis=1)
 
     # ── ROP global ─────────────────────────────────────────────
+    # Distribution-fitting approach (Pinçe et al. 2021; Syntetos et al. 2005;
+    # Teunter & Duncan 2009). Demand pattern (from ADI & CV²) selects the
+    # lead-time demand distribution; ROP = F⁻¹(service level).
+    #
+    #   Smooth / Erratic   : Normal       — regular demand (Pinçe §3.1)
+    #   Intermittent/Lumpy : Negative Binomial when overdispersed (var > mean)
+    #                        — "best option is the negative binomial distribution,
+    #                        as it allows for greater variability" (Pinçe §3.1.3).
+    #                        Poisson when var ≤ mean (equidispersed demand sizes).
+    #
+    # Lead-time extrapolation (Pinçe §3): μ(L) = μ·L, σ²(L) = σ²·L
     def compute_rop(row):
         mu    = float(row["mean_daily_demand"])
         sigma = float(row["std_daily_demand"])
+        pat   = str(row["demand_pattern"])
         cls   = str(row["item_class"])
         cv_c  = int(row["cv_class"])
-        z     = Z_MAP.get((cls, cv_c), norm.ppf(0.80))
+        z     = Z_MAP.get(cls, Z_MAP["C"])  # fallback: unclassified -> C (90%), consistent with fillna("C")
+        sl    = norm.cdf(z)        # service level probability from Z
+        L     = LEAD_TIME_ROP
+
         if mu <= 0:
             return 1
-        rop = mu * LEAD_TIME_ROP + z * sigma * np.sqrt(LEAD_TIME_ROP)
+
+        if pat in ("smooth", "erratic"):
+            # Normal distribution — standard formula for regular demand
+            rop = mu * L + z * sigma * np.sqrt(L)
+            return max(1, int(np.round(rop)))
+
+        # Intermittent / Lumpy — count distribution fitted to lead-time demand
+        mu_L  = mu * L                  # mean lead-time demand
+        var_L = (sigma ** 2) * L        # variance lead-time demand
+
+        if var_L > mu_L:
+            # Negative Binomial via method of moments (overdispersed)
+            #   var = μ + μ²/r  →  r = μ²/(var − μ),  p = r/(r + μ)
+            r = mu_L ** 2 / (var_L - mu_L)
+            p = r / (r + mu_L)
+            rop = nbinom.ppf(sl, n=r, p=p)
+        else:
+            # Poisson (equidispersed: var ≤ mean, near-constant demand size)
+            rop = poisson.ppf(sl, mu=mu_L)
+
         return max(1, int(np.round(rop)))
 
     df["rop_global"] = df.apply(compute_rop, axis=1)

@@ -48,7 +48,7 @@ class Robot(Object):
 
     lift = False
     # energy consumption related
-    mass = 100 # kg
+    mass = 300 # kg  (m_A, robot mass — Yohana Table 3.9 / Xu et al. Table III)
     load_mass = 0
     _gravity = 9.8
     _friction = 0.02

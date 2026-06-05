@@ -19,7 +19,7 @@ class Station(Object):
         self.order_ids: List[int] = []
         self.orders: List[Order] = []
         self.robot_job = 0
-        self.max_orders = 8 # Picking station capacity
+        self.max_orders = 6 # Picking station capacity (was 8; lowered to sharpen head-of-line blocking — an order whose SKU is stocked out holds a slot and blocks others)
         self.max_robots = 9
         self.short_path_threshold = 4
         self.robot_ids = {}

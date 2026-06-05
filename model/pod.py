@@ -13,6 +13,8 @@ class Pod(Object):
         self.is_idle = True
         self.station = None
         self.need_replenishment = False
+        self.reserved_fill = {}  # v7 anti-redundancy: per-SKU units this pod has
+        # promised to restock while in transit to replenishment (released on finish)
         self.mass = 0
         self.initial_mass = 0
         self.last_trigger = None
@@ -67,17 +69,28 @@ class Pod(Object):
             return True
         return False
 
-    def check_pod_index(self, kl: float = 0.5) -> bool:
-        """Layer 2 of AND baseline: Q_j >= KL.
-        Q_j = fraction of slots whose fill ratio (current_qty/limit_qty) < 0.5."""
-        if not self.skus:
+    def check_pod_index(self, flagged_skus, kl: float = 0.5, cap: int = 8) -> bool:
+        """Layer 2 of Warehouse Inventory-SKU in Pod baseline (Chou et al.).
+
+        Q_p = (Σ_{i∈flagged} U_ip) / |n_p|,  where U_ip = current_qty/limit_qty
+        is the pod-level inventory utilization ratio of flagged SKU i, and |n_p|
+        is the number of SKUs in the pod, capped at `cap` (=8, or fewer if the pod
+        has fewer unique SKUs) so that pods with many at-risk SKUs are not
+        overlooked. R_p = 1 iff Q_p >= KL. Only SKUs flagged by Layer 1 are summed.
+        """
+        if not self.skus or not flagged_skus:
             return False
-        count_below = sum(
-            1 for d in self.skus.values()
-            if d['limit_qty'] > 0 and (d['current_qty'] / d['limit_qty']) < 0.5
-        )
-        q_j = count_below / len(self.skus)
-        return q_j >= kl
+        n_p = len(self.skus)
+        denom = min(n_p, cap) if cap else n_p
+        if denom <= 0:
+            return False
+        sum_u_ip = 0.0
+        for sku in flagged_skus:
+            d = self.skus.get(sku)
+            if d is not None and d['limit_qty'] > 0:
+                sum_u_ip += d['current_qty'] / d['limit_qty']
+        q_p = sum_u_ip / denom
+        return q_p >= kl
 
     def replenish_all_skus(self):
         """Replenish all SKUs by setting each SKU's current quantity to its limit quantity."""

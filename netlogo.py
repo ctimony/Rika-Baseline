@@ -271,7 +271,7 @@ def draw_layout_from_generated_file(universe: Inventory):
         total_requested_item=4000,
         items_orders_class_configuration={"A": 0.8, "B": 0.15, "C": 0.05},
         quantity_range=[1, 12],
-        order_cycle_time=120,
+        order_cycle_time=150,
         order_period_time=8,
         order_start_arrival_time=0,
         date=1,
@@ -777,7 +777,7 @@ def generate_rop_summary():
 def assign_skus_to_pods(pod_manager):
     # Check if pods.csv exists in the current directory
     if not os.path.exists('pods.csv'):
-        PodGenerator(pod_types=[3], pod_num=[421], total_sku=4000,
+        PodGenerator(pod_types=[3], pod_num=[468], total_sku=4000,
                       items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
@@ -800,6 +800,8 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
     import pandas as _pd_cls
     _items_cls = _pd_cls.read_csv('items.csv').reset_index()
     item_class_dict = dict(zip(_items_cls['item_id'], _items_cls['item_class']))
+    # demand rate (mean daily demand) per SKU — used by the opportunity score (v7)
+    demand_rate_dict = dict(zip(_items_cls['item_id'], _items_cls['mean_daily_demand']))
 
     with open('pods.csv', mode='r', newline='') as file:
         reader = csv.DictReader(file)
@@ -825,7 +827,8 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
             # Add SKU Data of level
             item_class = item_class_dict.get(int(sku), 'C')
             n_slots_val = n_slots_dict.get(int(sku), 1)
-            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val, item_class, n_slots_val)
+            demand_rate_val = float(demand_rate_dict.get(int(sku), 0.0))
+            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val, item_class, n_slots_val, demand_rate_val)
 
     csv_file = 'skus_data.csv'
     if os.path.exists(csv_file):
@@ -842,7 +845,10 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
     pod_info.to_csv("pod_info.csv", index=False)
 
     with open('score_log.csv', 'w') as _f:
-        _f.write("tick,pod_id,pod_gap,urgency_max\n")
+        _f.write("tick,pod_id,score,pod_gap,total_space,urgency_max\n")
+
+    with open('gate_log.csv', 'w') as _f:
+        _f.write("tick,pod_id,pod_gap,urgency_max,eff_threshold,total_space,passed\n")
 
     print(f"Data has been saved to {csv_file}")
     df = pd.read_csv(csv_file)
@@ -967,7 +973,12 @@ def console_tick():
         tick_df.to_csv(os.path.join(result_dir, 'tick_metrics.csv'), index=False)
 
         orders_df = pd.read_csv(os.path.join('output', 'order-finished.csv'))
+        # cycle_time: from assignment to picking station to completion (process_start -> complete)
         orders_df['cycle_time'] = orders_df['order_complete_time'] - orders_df['process_start_time']
+        # OCT (Order Completion Time, Lamballais et al. 2020): from order ARRIVAL to
+        # completion — includes the time spent waiting in backlog before being assigned
+        # to a station. This is the order throughput time used in the RMFS literature.
+        orders_df['oct'] = orders_df['order_complete_time'] - orders_df['order_arrival']
         orders_df.to_csv(os.path.join(result_dir, 'orders.csv'), index=False)
 
         finished_orders = orders_df[orders_df['order_id'] >= 0]
@@ -989,6 +1000,9 @@ def console_tick():
         total_pod_visits = picks_df[['pod_id', 'processed_time']].drop_duplicates().shape[0] if not picks_df.empty else 0
         avg_cycle = round(finished_orders['cycle_time'].mean(), 2) if not finished_orders.empty else 0
         max_cycle = round(finished_orders['cycle_time'].max(), 2) if not finished_orders.empty else 0
+        # OCT = average order completion time from arrival (Lamballais et al. 2020), Eq (3.11)
+        avg_oct = round(finished_orders['oct'].mean(), 2) if not finished_orders.empty else 0
+        max_oct = round(finished_orders['oct'].max(), 2) if not finished_orders.empty else 0
         peak_jq = int(tick_df['job_queue_len'].max())
         avg_jq = round(tick_df['job_queue_len'].mean(), 2)
         throughput = round(orders_finished / orders_generated, 4) if orders_generated > 0 else 0
@@ -1008,6 +1022,8 @@ def console_tick():
             'avg_job_queue': avg_jq,
             'avg_cycle_time': avg_cycle,
             'max_cycle_time': max_cycle,
+            'avg_oct': avg_oct,
+            'max_oct': max_oct,
             'order_throughput': throughput,
             'total_replenishments': total_replenishments,
             'total_picks': total_picks,
@@ -1028,10 +1044,19 @@ def console_tick():
         print(f"  Avg job queue:     {avg_jq}")
         print(f"  Avg cycle time:    {avg_cycle}s")
         print(f"  Max cycle time:    {max_cycle}s")
+        print(f"  Avg OCT:           {avg_oct}s (arrival->complete)")
+        print(f"  Max OCT:           {max_oct}s")
         print(f"  Order throughput:  {throughput} ({orders_generated} generated)")
         print(f"  Replen/pick ratio: {reple_pick_ratio} ({total_replenishments}R / {total_picks}P)")
         print(f"  Trip efficiency:   {trip_efficiency} SKUs/trip ({skus_replenished} SKUs / {total_replenishments} trips)")
         print(f"  Pod utilization:   {pod_utilization} ({total_units_picked} units / {total_pod_visits} visits)")
+        _ws = getattr(universe, '_wait_stockout', 0)
+        _wr = getattr(universe, '_wait_robot', 0)
+        _wtot = _ws + _wr
+        if _wtot > 0:
+            print(f"  Wait cause:        stockout {_ws} ({_ws/_wtot*100:.0f}%) vs robot-busy {_wr} ({_wr/_wtot*100:.0f}%)")
+        summary['wait_stockout'] = _ws
+        summary['wait_robot'] = _wr
         print(f"  Results saved to:  {result_dir}")
         print("==============================\n")
 
