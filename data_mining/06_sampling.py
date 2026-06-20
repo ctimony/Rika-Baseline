@@ -1,19 +1,36 @@
 """
 06_sampling.py
 ==============
-Class-proportion weighted sampling of SKUs for simulation.
+Impact-score quartile sampling of SKUs for simulation (Opsi A+).
 
-Method (based on thesis approach):
-1. Compute importance score per SKU as geometric mean of 3 factors:
-   - composite  = mean_daily_demand * order_frequency
-   - stability  = 1 / ADI
-   - variability = 1 + CV²  (1 added to avoid zero for smooth SKUs)
-   importance = (composite * stability * variability)^(1/3)
+Why sample at all:
+  The full dictionary has 7,081 SKUs needing ~13,026 pod slots, but the
+  physical grid holds 500 pod cells, 10 of which are charging stations →
+  489 active SKU-storage pods × 20 slots = 9,780 slot budget. So a subset must
+  be chosen. This is also operationally realistic for an RMFS: not every
+  slow-mover (class C) is kept online in mobile pods at once.
 
-2. Normalize importance score within each ABC class → sampling probability
+Selection method — impact-quartile priority fill (deterministic):
+  1. impact score per SKU = geometric mean of 3 factors
+       composite   = mean_daily_demand * item_order_frequency
+       stability   = 1 / ADI                  (regular demand ↑)
+       variability = 1 + CV²                  (size variability)
+       impact = (composite * stability * variability)^(1/3)
+  2. Within each ABC class, split SKUs into 4 quartiles by impact (Q4=highest).
+  3. ALL of class A is taken IN FULL — the high-movers are never sampled away
+     (they fit in ~half the pod budget).
+  4. PRIORITY FILL by quartile: from the remaining budget, take all of the
+     highest quartile first (Q4 of B and C), then Q3, then Q2, then Q1, until
+     the slot budget is exhausted. Whatever quartile the budget runs out in is
+     filled top-impact-first; lower quartiles below it are dropped. This GUARANTEES
+     the highest-impact SKUs (Q4, and as far down as the budget reaches) are kept
+     in full — drops fall only on the lowest-impact quartile(s).
 
-3. Weighted sampling per class, proportional to original class distribution
-   Target: 3,000 SKUs total
+Why priority fill (vs uniform fraction per quartile):
+  - Taking all of class A + all of Q4 means NO high-impact SKU is ever dropped.
+  - The drop is concentrated on the least-impactful tail (lowest quartile), which
+    is operationally what an RMFS would keep offline — instead of shaving a uniform
+    slice off every quartile (which would discard some high-impact Q4 SKUs).
 
 Output: data_mining/output/06_sampled_skus.csv
 """
@@ -26,95 +43,104 @@ ROOT        = os.path.dirname(os.path.abspath(__file__))
 DICT_PATH   = os.path.join(ROOT, "..", "items_dictionary.csv")
 OUTPUT_PATH = os.path.join(ROOT, "output", "06_sampled_skus.csv")
 
-TARGET_SKU  = 3000
-RANDOM_SEED = 42
+# Pod budget = active SKU pods (layout.py total_pods_active) × slots per pod.
+ACTIVE_PODS    = 489
+SLOTS_PER_POD  = 20
+SLOT_BUDGET    = ACTIVE_PODS * SLOTS_PER_POD   # 9,780
+PROTECT_CLASSES = ["A"]                         # ABC classes taken in full (never sampled)
 
 
 def main():
     print("=" * 60)
-    print("  SKU Sampling — Class-Proportion Weighted")
+    print("  SKU Sampling — Impact-Quartile Stratified (Opsi A+)")
     print("=" * 60)
 
     df = pd.read_csv(DICT_PATH)
     df["item_code"] = df["item_code"].astype(str)
+    print(f"\n  Input SKUs    : {len(df):,}")
+    print(f"  Slot budget   : {SLOT_BUDGET:,} ({ACTIVE_PODS} pods × {SLOTS_PER_POD})")
 
-    total = len(df)
-    print(f"\n  Input SKUs          : {total:,}")
-    print(f"  Target sample       : {TARGET_SKU:,}")
-
-    # ── Importance score ───────────────────────────────────────
+    # ── Impact score ───────────────────────────────────────────
     df["composite"]   = df["mean_daily_demand"] * df["item_order_frequency"]
     df["stability"]   = 1.0 / df["adi"].clip(lower=0.01)
     df["variability"] = 1.0 + df["cv2"]
+    df["impact"] = (
+        (df["composite"] * df["stability"] * df["variability"]).clip(lower=0).pow(1 / 3)
+    )
 
-    # Geometric mean of 3 factors
-    df["importance"] = (
-        df["composite"] * df["stability"] * df["variability"]
-    ).clip(lower=0).pow(1/3)
+    # ── Quartile within each ABC class ─────────────────────────
+    df["quartile"] = df.groupby("item_class")["impact"].transform(
+        lambda x: pd.qcut(x.rank(method="first"), 4, labels=["Q1", "Q2", "Q3", "Q4"])
+    )
 
-    # ── Proportional target per ABC class ──────────────────────
-    class_counts = df["item_class"].value_counts().sort_index()
-    class_targets = {}
-    allocated = 0
-    classes = sorted(class_counts.index)
-    for i, cls in enumerate(classes):
-        if i == len(classes) - 1:
-            # Last class gets remainder to ensure exact total
-            class_targets[cls] = TARGET_SKU - allocated
-        else:
-            n = round(class_counts[cls] / total * TARGET_SKU)
-            class_targets[cls] = n
-            allocated += n
+    classes = ["A", "B", "C"]
+    # Quartiles from highest impact (Q4) to lowest (Q1) — fill order.
+    quarts_hi_to_lo = ["Q4", "Q3", "Q2", "Q1"]
 
-    print(f"\n  Sampling targets per class:")
-    for cls in classes:
-        n_pop = class_counts[cls]
-        n_samp = class_targets[cls]
-        print(f"    {cls}: {n_samp:,} from {n_pop:,} ({n_samp/n_pop*100:.1f}% of class)")
+    # ── Priority fill ──────────────────────────────────────────
+    # 1) Protected classes (A) taken in full, regardless of budget.
+    # 2) Remaining budget filled quartile-by-quartile, highest impact first,
+    #    each quartile (B+C pooled) taken top-impact-first. The quartile where
+    #    the budget runs out is partially filled; lower quartiles are dropped.
+    protected = df[df["item_class"].isin(PROTECT_CLASSES)]
+    samplable = df[~df["item_class"].isin(PROTECT_CLASSES)]
 
-    # ── Weighted sampling per class ────────────────────────────
-    sampled_parts = []
-    np.random.seed(RANDOM_SEED)
+    parts = [protected]
+    used  = int(protected["slots_needed"].sum())
+    cutoff_quartile = None
 
-    for cls in classes:
-        sub = df[df["item_class"] == cls].copy()
-        n_samp = class_targets[cls]
+    for q in quarts_hi_to_lo:
+        cell = samplable[samplable["quartile"] == q].sort_values(
+            "impact", ascending=False
+        )
+        cum = cell["slots_needed"].cumsum()
+        fits = cell[used + cum <= SLOT_BUDGET]
+        parts.append(fits)
+        used += int(fits["slots_needed"].sum())
+        if len(fits) < len(cell):
+            cutoff_quartile = q
+            break  # budget exhausted within this quartile; lower quartiles dropped
 
-        # Normalize importance → probability
-        total_imp = sub["importance"].sum()
-        if total_imp > 0:
-            sub["prob"] = sub["importance"] / total_imp
-        else:
-            sub["prob"] = 1.0 / len(sub)
-
-        # Cap sample to available SKUs
-        n_samp = min(n_samp, len(sub))
-        sampled = sub.sample(n=n_samp, weights="prob", random_state=RANDOM_SEED)
-        sampled_parts.append(sampled)
-
-    result = pd.concat(sampled_parts).reset_index(drop=True)
+    result = pd.concat(parts)
+    total_slots = int(result["slots_needed"].sum())
+    pods_used   = int(np.ceil(total_slots / SLOTS_PER_POD))
 
     # ── Summary ────────────────────────────────────────────────
-    print(f"\n  Final sample        : {len(result):,} SKUs")
-    print(f"\n  ABC distribution:")
+    print(f"\n  Priority fill by quartile (Q4→Q1, highest impact first)")
+    print(f"  Class A protected (taken in full)")
+    if cutoff_quartile is not None:
+        print(f"  Budget ran out in quartile: {cutoff_quartile} "
+              f"(quartiles below it fully dropped)")
+    else:
+        print(f"  All quartiles fully kept (budget not binding)")
+    print(f"\n  Selected SKUs : {len(result):,}")
+    print(f"  Slots used    : {total_slots:,} / {SLOT_BUDGET:,}")
+    print(f"  Pods used     : {pods_used:,} / {ACTIVE_PODS:,}")
+
+    print(f"\n  ABC stock mix (selected vs population):")
     for cls in classes:
-        n = (result["item_class"] == cls).sum()
-        print(f"    {cls}: {n:,} ({n/len(result)*100:.1f}%)")
+        sel_pct = (result["item_class"] == cls).mean() * 100
+        pop_pct = (df["item_class"] == cls).mean() * 100
+        print(f"    {cls}: {sel_pct:4.1f}%  (population {pop_pct:4.1f}%)")
 
-    print(f"\n  Demand pattern:")
-    for pat in ["smooth", "erratic", "intermittent", "lumpy"]:
-        n = (result["demand_pattern"] == pat).sum()
-        print(f"    {pat:13s}: {n:,} ({n/len(result)*100:.1f}%)")
+    print(f"\n  Demand share by order_frequency (selected vs population):")
+    fsel = result.groupby("item_class")["item_order_frequency"].sum()
+    fpop = df.groupby("item_class")["item_order_frequency"].sum()
+    for cls in classes:
+        print(f"    {cls}: {fsel[cls]/fsel.sum():.3f}  (population {fpop[cls]/fpop.sum():.3f})")
+    cover = result["mean_daily_demand"].sum() / df["mean_daily_demand"].sum() * 100
+    print(f"\n  Demand coverage : {cover:.1f}%")
 
-    print(f"\n  Slots needed        : {result['slots_needed'].sum():,}")
-    pods_needed = int(np.ceil(result["slots_needed"].sum() / 20))
-    print(f"  Pods needed (20/pod): {pods_needed:,}")
+    print(f"\n  Class A coverage (must be 100% — A taken in full):")
+    A = df[df["item_class"] == "A"]
+    A_used = A["item_code"].isin(set(result["item_code"]))
+    print(f"    A used: {A_used.sum():,}/{len(A):,}")
 
-    # Save — keep all columns from items_dictionary
-    drop_cols = ["composite", "stability", "variability", "importance", "prob"]
-    result = result.drop(columns=[c for c in drop_cols if c in result.columns])
-    result = result.sort_values("item_order_frequency", ascending=False).reset_index(drop=True)
-    result.to_csv(OUTPUT_PATH, index=False)
+    # ── Save (drop helper columns) ─────────────────────────────
+    drop_cols = ["composite", "stability", "variability", "impact", "quartile"]
+    out = result.drop(columns=[c for c in drop_cols if c in result.columns])
+    out = out.sort_values("item_order_frequency", ascending=False).reset_index(drop=True)
+    out.to_csv(OUTPUT_PATH, index=False)
     print(f"\n  Saved → {OUTPUT_PATH}")
     print("=" * 60)
 

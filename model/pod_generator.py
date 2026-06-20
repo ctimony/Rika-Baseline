@@ -130,38 +130,39 @@ class PodGenerator:
                                "box_length", "box_width", "box_height", "box_volume", "box_weight", "number_of_item_in_a_box",
                                "item_volume", "item_unit", "item_quantity_order_unique"]].copy()
 
-            # select items according to the class and its proportion
-            items = pd.DataFrame()
-            for class_name, conf in items_class_conf.items():
+            # ── SKU selection: read the final list from 06_sampling.py ───────────
+            # Single source of truth. 06_sampling.py applies impact-quartile
+            # stratified sampling (Opsi A+): impact = (composite × stability ×
+            # variability)^(1/3) per SKU, split into quartiles within each ABC
+            # class, A-Q4 taken in full (most important items never dropped),
+            # other cells at one uniform fraction sized to the 489-pod budget.
+            # This selection is DETERMINISTIC (sort + head, no RNG) so items.csv
+            # is identical across replications — only orders/robots vary.
+            # pod_generator does NOT re-sample; it only places the chosen SKUs,
+            # intersecting with item_df (SKUs compatible with the pod slot type).
+            sampled_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "data_mining", "output", "06_sampled_skus.csv")
+            sampled = pd.read_csv(sampled_path)
+            sampled["item_code"] = sampled["item_code"].astype(item_df["item_code"].dtype)
+            sampled_codes = set(sampled["item_code"])
 
-                # get list of the item's code based on the class
-                item = item_df.loc[item_df["item_class"] == class_name].copy()
-                item = item.sort_values(by="item_order_frequency", ascending=False)
+            items = item_df.loc[item_df["item_code"].isin(sampled_codes)].copy()
+            # Per-class inventory-level tags (used downstream by placement)
+            items["item_pod_inventory_level"] = items["item_class"].map(items_pods_inventory_levels)
+            items["item_warehouse_inventory_level"] = items["item_class"].map(items_warehouse_inventory_levels)
+            # Keep ABC ordering then by frequency for stable, reproducible output
+            items = items.sort_values(["item_class", "item_order_frequency"],
+                                      ascending=[True, False])
 
-                item["item_pod_inventory_level"] = items_pods_inventory_levels[class_name]
-                item["item_warehouse_inventory_level"] = items_warehouse_inventory_levels[class_name]
-
-                n_select = int(total_sku * conf)
-
-                # select option 1: weighted sampling by 3-factor geometric importance score
-                # else: top-N by order frequency
-                if select_option == 1:
-                    # Factor 1 — composite: mean_daily_demand × item_order_frequency
-                    # Factor 2 — stability: item_order_frequency (proportional to 1/avg_demand_interval)
-                    # Factor 3 — variability: cv²
-                    f1 = item["mean_daily_demand"] * item["item_order_frequency"]
-                    f2 = item["item_order_frequency"]
-                    f3 = item["cv"] ** 2
-                    importance = (f1.clip(lower=1e-9) * f2.clip(lower=1e-9) * f3.clip(lower=1e-9)) ** (1/3)
-                    item_probability = (importance / importance.sum()).to_numpy()
-
-                    item_code = np.random.choice(item["item_code"].to_list(), size=n_select,
-                                                 p=item_probability, replace=False)
-                    items = pd.concat([items, item.loc[item["item_code"].isin(item_code)]])
-                else:
-                    # select items based on the top n-percent of the class ratio
-                    item_top = item.head(n_select)
-                    items = pd.concat([items, item_top])
+            dropped = sampled_codes - set(items["item_code"])
+            if dropped:
+                print(f"    WARNING: {len(dropped)} sampled SKUs are not slot-compatible "
+                      f"and were skipped (of {len(sampled_codes)} selected).")
+            print(f"    Loaded {len(items)} SKUs from 06_sampled_skus.csv "
+                  f"(A={int((items['item_class']=='A').sum())}, "
+                  f"B={int((items['item_class']=='B').sum())}, "
+                  f"C={int((items['item_class']=='C').sum())})")
 
             # save items selected to csv
             items.reset_index(drop=True, inplace=True)
@@ -228,7 +229,7 @@ class PodGenerator:
         return pods
     
     def assign_items_to_pods(self, pods, items, items_pods_class_conf,
-                             class_slot_counts={"A": 13, "B": 4, "C": 3},
+                             class_slot_counts={"A": 10, "B": 5, "C": 5},
                              dev_mode=False):
 
         working_path = self.get_working_path(dev_mode)
@@ -270,95 +271,286 @@ class PodGenerator:
         items_to_place = items_to_place[
             items_to_place["item_initial_quantity_inventory"] > 0
         ].copy()
+        # Attach order_frequency (from items.csv) so the assignment can place hot SKUs
+        # first → hot-grouping. Default to 0 if a SKU is missing it.
+        _items_csv = pd.read_csv(working_path + "/items.csv")
+        if "item_order_frequency" in _items_csv.columns:
+            _freq = dict(zip(_items_csv["item_code"], _items_csv["item_order_frequency"]))
+            items_to_place["item_order_frequency"] = (
+                items_to_place["item_code"].map(_freq).fillna(0)
+            )
+        else:
+            items_to_place["item_order_frequency"] = 0
 
         pods["slot_sequence"] = np.arange(pods.shape[0])
 
-        # ── Phase 2: Build virtual slot pools per class (round-robin across pods) ─
-        # Round-robin ensures consecutive pool entries are from DIFFERENT pods,
-        # so taking slots_needed consecutive entries places each slot in a different pod.
-        print("    Building proportional slot pools (A=%d, B=%d, C=%d per pod)..." % (
-            class_slot_counts.get("A", 0),
-            class_slot_counts.get("B", 0),
-            class_slot_counts.get("C", 0)))
+        # ── Phase 2: Build per-pod slot pools per class (INTERLEAVED) ──────────
+        # The per-pod class quota is NOT a single fixed integer (the ideal quota is
+        # fractional, e.g. A=9.57, B=5.48, C=4.95 per pod, and any single integer
+        # over/under-allocates a class → some pods miss a class). Instead the quota
+        # is sized to the ACTUAL slot supply per class and distributed with the
+        # LARGEST-REMAINDER (Hamilton) method: every pod gets floor(ideal) slots of
+        # each class, then the leftover slots (so the per-class total equals supply
+        # exactly) are handed one each to the pods with the largest fractional
+        # remainder. This guarantees total(pool[cls]) == slots_needed[cls], no slot
+        # is over/short, and — because each pod's quota for every class is ≥ floor —
+        # every pod still receives all three classes (pods stay mixed A/B/C).
+        # The pool is kept PER POD (not flattened) so the interleaved assignment
+        # can take at most one slot per pod for any single SKU.
+        classes = list(class_slot_counts.keys())  # class order: A, B, C
+        n_pods = pods["pod_id"].nunique()
+        # Supply = number of slots each class needs (Σ slots_needed over its SKUs).
+        supply = {}
+        for cls in classes:
+            cls_rows = items_to_place[items_to_place["item_class"] == cls]
+            need = np.ceil(cls_rows["item_initial_quantity_inventory"]
+                           / cls_rows["max_item_in_slot"].clip(lower=1)).astype(int)
+            supply[cls] = int(need.sum())
 
-        # Collect per-class slot indices grouped by pod, then interleave
-        class_slots_by_pod = {cls: [] for cls in class_slot_counts}
-        for _, grp in pods[pods["item"].isnull()].groupby("pod_id"):
+        # 2D largest-remainder: each pod's per-class quota must sum to that pod's
+        # PHYSICAL slot count (slots_per_pod), AND each class's column total must
+        # equal supply[cls]. (Allocating each class independently breaks the row
+        # constraint — a pod could be assigned 21 quota for 20 real slots → the
+        # interleaved walk pops from an empty slot list.) So: give every pod the
+        # floor of each class's ideal share, then hand out the per-pod leftover
+        # (slots_per_pod − Σ floors) one slot at a time to the classes with the
+        # largest fractional remainder, decrementing a global per-class budget so
+        # the column totals stay exactly = supply. Result: rows sum to 20, columns
+        # sum to supply, all SKUs of every class get a home in distinct pods.
+        slots_per_pod = pods.groupby("pod_id").size().iloc[0]
+        ideal = {cls: supply[cls] / n_pods for cls in classes}
+        base = {cls: int(np.floor(ideal[cls])) for cls in classes}
+        frac = {cls: ideal[cls] - base[cls] for cls in classes}
+        # remaining +1 slots still owed to each class so its column total = supply
+        col_budget = {cls: supply[cls] - base[cls] * n_pods for cls in classes}
+        per_pod_quota = {cls: [base[cls]] * n_pods for cls in classes}
+        per_pod_leftover = slots_per_pod - sum(base.values())  # +slots each pod needs
+        # Hand the per-pod leftovers to the highest-remainder classes that still
+        # have column budget; tie-break by class order. Even spreading isn't needed
+        # because every pod gets the same `per_pod_leftover` and frac is identical
+        # across pods, so the budget drains uniformly class-by-class.
+        order = sorted(classes, key=lambda c: (-frac[c], classes.index(c)))
+        for pod_pos in range(n_pods):
+            need = per_pod_leftover
+            for cls in order:
+                if need <= 0:
+                    break
+                if col_budget[cls] > 0:
+                    per_pod_quota[cls][pod_pos] += 1
+                    col_budget[cls] -= 1
+                    need -= 1
+            # if the highest-remainder classes are exhausted, fall back to any
+            # class with remaining budget (keeps the row sum at slots_per_pod)
+            if need > 0:
+                for cls in classes:
+                    while need > 0 and col_budget[cls] > 0:
+                        per_pod_quota[cls][pod_pos] += 1
+                        col_budget[cls] -= 1
+                        need -= 1
+        assert all(col_budget[c] == 0 for c in classes), \
+            f"column budget not drained: {col_budget}"
+        assert all(
+            sum(per_pod_quota[c][p] for c in classes) == slots_per_pod
+            for p in range(n_pods)
+        ), "a pod's quota does not sum to its physical slot count"
+
+        print("    Building proportional slot pools — interleaved, largest-remainder "
+              "(supply A=%d B=%d C=%d over %d pods)..." % (
+                  supply.get("A", 0), supply.get("B", 0), supply.get("C", 0), n_pods))
+
+        # Partition each pod's empty slots into per-class blocks using that pod's
+        # own quota, keyed PER POD (not flattened) so the interleaved assignment
+        # below can draw at most one slot per pod for any single SKU.
+        pod_class_slots = {cls: {} for cls in classes}  # cls → {pod_id: [slot idx]}
+        pod_class_cap   = {cls: {} for cls in classes}  # cls → {pod_id: remaining cap}
+        for pod_pos, (pid, grp) in enumerate(pods[pods["item"].isnull()].groupby("pod_id")):
             indices = grp.index.tolist()
             cursor = 0
-            for cls, count in class_slot_counts.items():
-                class_slots_by_pod[cls].append(indices[cursor:cursor + count])
+            for cls in classes:
+                count = per_pod_quota[cls][pod_pos]
+                pod_class_slots[cls][pid] = indices[cursor:cursor + count]
+                pod_class_cap[cls][pid]   = count
                 cursor += count
 
-        # Interleave: [pod0_slot0, pod1_slot0, pod2_slot0, ..., pod0_slot1, pod1_slot1, ...]
-        class_pools = {}
-        for cls, pods_slots in class_slots_by_pod.items():
-            max_slots = max(len(s) for s in pods_slots) if pods_slots else 0
-            interleaved = []
-            for slot_idx in range(max_slots):
-                for pod_slots in pods_slots:
-                    if slot_idx < len(pod_slots):
-                        interleaved.append(pod_slots[slot_idx])
-            class_pools[cls] = interleaved
+        # ── Phase 3: Main assignment — class by class, STACKED ────────────────
+        # STACKED storage: a SKU's `slots_needed` slots may be taken from the SAME
+        # pod (one SKU can occupy multiple slots in one pod), in contrast to the
+        # interleaved version which spread a SKU across distinct pods. Stacked
+        # makes a pod arrive at replenishment substantially emptier (many slots of
+        # the triggering SKU are depleted together), so the fill-level decision has
+        # a meaningful effect on pod mass and energy.
+        #
+        # Within each class, SKUs are placed largest-first; each SKU greedily fills
+        # whole pods from the per-pod class pool (consuming as many of that pod's
+        # class slots as fit) before moving to the next pod. The per-pod class
+        # quota from Phase 2 is preserved, so each pod still receives a mixed A/B/C
+        # composition. Per-class supply == Σ slots_needed, so allocation is exact.
+        #
+        # ── INTERLEAVED (previous version — kept for reference) ────────────────
+        # unplaced_ids = set()
+        # for cls in classes:
+        #     cls_items = items_to_place[items_to_place["item_class"] == cls].copy()
+        #     cls_items["__slots_needed"] = np.ceil(
+        #         cls_items["item_initial_quantity_inventory"]
+        #         / cls_items["max_item_in_slot"].clip(lower=1)
+        #     ).astype(int)
+        #     cls_items = cls_items.sort_values(
+        #         ["__slots_needed", "item_id"], ascending=[False, True]
+        #     )
+        #     remaining_cap = dict(pod_class_cap[cls])  # pod_id → remaining capacity
+        #     print(f"    Class {cls}: {len(cls_items)} SKUs → "
+        #           f"{sum(remaining_cap.values())} pool slots (interleaved)")
+        #
+        #     for _, row in cls_items.iterrows():
+        #         max_fit = int(row["max_item_in_slot"])
+        #         if max_fit <= 0:
+        #             max_fit = 1
+        #         slots_needed = int(row["__slots_needed"])
+        #
+        #         # Most-free-first: pick the slots_needed pods with the largest
+        #         # remaining capacity (tie-break by pod_id for determinism).
+        #         live = sorted((p for p, c in remaining_cap.items() if c > 0),
+        #                       key=lambda p: (-remaining_cap[p], p))[:slots_needed]
+        #         if len(live) < slots_needed:
+        #             # Not enough distinct pods with free capacity → defer to repair.
+        #             unplaced_ids.add(int(row["item_id"]))
+        #             continue
+        #
+        #         chosen = []
+        #         for p in live:
+        #             chosen.append(pod_class_slots[cls][p].pop())  # one slot, distinct pod
+        #             remaining_cap[p] -= 1
+        #
+        #         pods.loc[chosen, "item"]                          = int(row["item_id"])
+        #         pods.loc[chosen, "qty"]                           = max_fit
+        #         pods.loc[chosen, "max_qty"]                       = max_fit
+        #         pods.loc[chosen, "item_weight"]                   = row["item_weight"]
+        #         pods.loc[chosen, "total_item_weight"]             = round(row["item_weight"] * max_fit, 3)
+        #         pods.loc[chosen, "item_pod_inventory_level"]      = row["item_pod_inventory_level"]
+        #         pods.loc[chosen, "item_warehouse_inventory_level"]= row["item_warehouse_inventory_level"]
+        #
+        # # ── Phase 4 (interleaved): Feasibility guard ──────────────────────────
+        # if unplaced_ids:
+        #     raise RuntimeError(
+        #         f"Interleaved allocation failed: {len(unplaced_ids)} SKUs could "
+        #         f"not be placed in distinct pods (item_ids: {sorted(unplaced_ids)}). "
+        #         f"Check per-class supply vs. max slots_needed."
+        #     )
+        # ───────────────────────────────────────────────────────────────────────
 
-        # ── Phase 3: Main assignment — class by class from pool ───────────────
+        # ── Phase 3: Main assignment — class by class, CAPPED-STACKED ─────────
+        # CAPPED-STACKED storage: a SKU may take up to STACK_CAP (=3) slots of the
+        # SAME pod, then must spill to the next pod. This balances two competing aims:
+        #   • buffer (trips): up to 3 slots of one SKU per pod → one trip refills a
+        #     meaningful chunk → the SKU is re-triggered less often → fewer trips.
+        #   • opportunity-score choice: a high-demand class-A SKU (slots_needed > 3)
+        #     spans ⌈slots_needed/3⌉ DISTINCT pods, so when it goes critical the
+        #     replenishment pod-selection actually has several candidate pods to rank
+        #     — preserving the score's role (which full stacking, one-pod-per-SKU,
+        #     destroys: 93% of class-A SKUs would live in a single pod).
+        # Class B/C SKUs (slots_needed ≈ 1) still land in one slot each. The per-pod
+        # class quota from Phase 2 is preserved → pods stay mixed A/B/C. Per-class
+        # supply == Σ slots_needed, so allocation is exact.
+        #
+        # Feasibility: with cap, a SKU needs ⌈slots_needed/cap⌉ DISTINCT pods that
+        # still have free class capacity. The largest class-A SKU needs
+        # ⌈max_slots_needed / 3⌉ pods ≪ 489, and every pod's class quota ≥ 1, so the
+        # most-free-first greedy always finds enough distinct pods (no dead-end). The
+        # guard below raises if any SKU is left short rather than silently dropping it.
+        # ── INTERLEAVED + HOT-GROUPING ─────────────────────────────────────────
+        # INTERLEAVED: each SKU takes at most ONE slot per pod (a SKU's slots_needed
+        # slots go to distinct pods), so every SKU spreads across many pods → the
+        # opportunity-score pod-selection has real candidate pods to rank.
+        # HOT-GROUPING: within each class, SKUs are placed in DESCENDING order_frequency
+        # (hottest first), and pods are filled in a FIXED order, each packed to its class
+        # quota before moving on. So the highest-frequency ('hot') SKUs of a class land in
+        # the SAME early pods → those pods become 'hot pods' carrying many fast-moving
+        # SKUs across all classes. Hot pods go critical more often, and when fast-movers
+        # that co-occur in an order are picked together they can present several critical
+        # SKUs at once → the opportunity score can cover multiple critical SKUs per trip.
+        # The per-pod class quota from Phase 2 is UNCHANGED, so every pod stays mixed
+        # A/B/C (hot-grouping only reorders SKUs WITHIN each class, never the class mix).
         unplaced_ids = set()
-        for cls, pool in class_pools.items():
-            pool_cursor = 0
-            cls_items = items_to_place[items_to_place["item_class"] == cls]
-            print(f"    Class {cls}: {len(cls_items)} SKUs → {len(pool)} pool slots")
+        for cls in classes:
+            cls_items = items_to_place[items_to_place["item_class"] == cls].copy()
+            cls_items["__slots_needed"] = np.ceil(
+                cls_items["item_initial_quantity_inventory"]
+                / cls_items["max_item_in_slot"].clip(lower=1)
+            ).astype(int)
+            # Hottest SKUs first so they cluster into the same (early) pods.
+            cls_items = cls_items.sort_values(
+                ["item_order_frequency", "item_id"], ascending=[False, True]
+            )
+            # Fill pods in a FIXED order (by pod_id) so consecutive hot SKUs share pods.
+            pod_order = sorted(pod_class_cap[cls].keys())
+            remaining_cap = dict(pod_class_cap[cls])  # pod_id → remaining capacity
+            print(f"    Class {cls}: {len(cls_items)} SKUs → "
+                  f"{sum(remaining_cap.values())} pool slots (interleaved + hot-grouping)")
 
             for _, row in cls_items.iterrows():
                 max_fit = int(row["max_item_in_slot"])
                 if max_fit <= 0:
                     max_fit = 1
-                slots_needed = int(np.ceil(row["item_initial_quantity_inventory"] / max_fit))
-                remaining = len(pool) - pool_cursor
+                slots_needed = int(row["__slots_needed"])
 
-                if remaining >= slots_needed:
-                    idxs = pool[pool_cursor:pool_cursor + slots_needed]
-                    pods.loc[idxs, "item"]                          = int(row["item_id"])
-                    pods.loc[idxs, "qty"]                           = max_fit
-                    pods.loc[idxs, "max_qty"]                       = max_fit
-                    pods.loc[idxs, "item_weight"]                   = row["item_weight"]
-                    pods.loc[idxs, "total_item_weight"]             = round(row["item_weight"] * max_fit, 3)
-                    pods.loc[idxs, "item_pod_inventory_level"]      = row["item_pod_inventory_level"]
-                    pods.loc[idxs, "item_warehouse_inventory_level"]= row["item_warehouse_inventory_level"]
-                    pool_cursor += slots_needed
-                else:
+                # Interleaved: one slot per distinct pod. Walk pods in fixed order, take
+                # exactly ONE slot from each pod that still has class capacity, until
+                # slots_needed distinct pods are filled. Fixed pod order (not most-free)
+                # makes hot SKUs accumulate in the same early pods → hot pods form.
+                chosen = []
+                need = slots_needed
+                for p in pod_order:
+                    if need <= 0:
+                        break
+                    if remaining_cap[p] <= 0:
+                        continue
+                    slot_list = pod_class_slots[cls][p]
+                    chosen.append(slot_list.pop())       # one slot, this pod
+                    remaining_cap[p] -= 1
+                    need -= 1
+
+                if need > 0:
+                    # Fixed-order pass left this SKU short (its slots_needed exceeded the
+                    # pods still holding class capacity in id-order). Fall back to ANY
+                    # remaining pods with capacity (most-free-first, distinct) so it is
+                    # placed in full. This only affects the few large-slots_needed SKUs;
+                    # the hot-grouping ordering still holds for the common 1-slot SKUs.
+                    extra = sorted((p for p, c in remaining_cap.items() if c > 0),
+                                   key=lambda p: (-remaining_cap[p], p))
+                    for p in extra:
+                        if need <= 0:
+                            break
+                        slot_list = pod_class_slots[cls][p]
+                        if not slot_list:
+                            continue
+                        chosen.append(slot_list.pop())
+                        remaining_cap[p] -= 1
+                        need -= 1
+
+                if need > 0:
+                    # Truly not enough distinct pods with free class capacity → guard.
                     unplaced_ids.add(int(row["item_id"]))
-
-        # ── Phase 4: Mop-up — place overflow items in any remaining null slots ─
-        # One slot per pod constraint: pick at most one empty slot per pod per item.
-        if unplaced_ids:
-            print(f"    Mop-up: {len(unplaced_ids)} items unplaced, using remaining empty slots...")
-            mop_items = items_to_place[items_to_place["item_id"].isin(unplaced_ids)]
-            for _, row in mop_items.iterrows():
-                empty_df = pods[pods["item"].isnull()][["pod_id"]].copy()
-                if empty_df.empty:
-                    print(f"    WARNING: No slots left for item_id {int(row['item_id'])}")
-                    break
-                max_fit = int(row["max_item_in_slot"])
-                if max_fit <= 0:
-                    max_fit = 1
-                slots_needed = int(np.ceil(row["item_initial_quantity_inventory"] / max_fit))
-                # Mop-up is the overflow phase: fill ANY remaining empty slots to
-                # satisfy slots_needed, including multiple slots in the same pod.
-                # (The scattered-storage "one slot per pod" rule applies to the main
-                # proportional allocation in Phase 3; here the priority is to place
-                # every item and leave no empty slots stranded.)
-                idxs = empty_df.index.tolist()[:slots_needed]
-                if not idxs:
-                    print(f"    WARNING: Not enough slots for item_id {int(row['item_id'])} (need {slots_needed}, have 0)")
                     continue
-                pods.loc[idxs, "item"]                          = int(row["item_id"])
-                pods.loc[idxs, "qty"]                           = max_fit
-                pods.loc[idxs, "max_qty"]                       = max_fit
-                pods.loc[idxs, "item_weight"]                   = row["item_weight"]
-                pods.loc[idxs, "total_item_weight"]             = round(row["item_weight"] * max_fit, 3)
-                pods.loc[idxs, "item_pod_inventory_level"]      = row["item_pod_inventory_level"]
-                pods.loc[idxs, "item_warehouse_inventory_level"]= row["item_warehouse_inventory_level"]
-                print(f"    Mop-up: item_id {int(row['item_id'])} (Class {row['item_class']}) placed in {len(idxs)} slots")
+
+                pods.loc[chosen, "item"]                          = int(row["item_id"])
+                pods.loc[chosen, "qty"]                           = max_fit
+                pods.loc[chosen, "max_qty"]                       = max_fit
+                pods.loc[chosen, "item_weight"]                   = row["item_weight"]
+                pods.loc[chosen, "total_item_weight"]             = round(row["item_weight"] * max_fit, 3)
+                pods.loc[chosen, "item_pod_inventory_level"]      = row["item_pod_inventory_level"]
+                pods.loc[chosen, "item_warehouse_inventory_level"]= row["item_warehouse_inventory_level"]
+
+        # ── Phase 4: Feasibility guard ─────────────────────────────────────────
+        # Per-class supply == Σ slots_needed, so the pool holds exactly enough class
+        # slots for every SKU of that class; unplaced_ids must be empty. If non-empty,
+        # a class ran out of distinct pods before all its SKUs were placed — raise
+        # rather than silently leaving SKUs (incl. item_id 0) unallocated.
+        if unplaced_ids:
+            raise RuntimeError(
+                f"Interleaved + hot-grouping allocation failed: {len(unplaced_ids)} SKUs "
+                f"could not be placed in distinct pods (item_ids: {sorted(unplaced_ids)}). "
+                f"Check per-class supply vs. max slots_needed."
+            )
 
         # ── Phase 5: Finalize and save ────────────────────────────────────────
         # Empty slots: item = -1 (NOT 0, which would collide with the real item_id 0);

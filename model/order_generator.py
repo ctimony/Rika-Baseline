@@ -28,10 +28,44 @@ def get_working_path(dev_mode=False):
 
     return result
 
-def get_random_quantity(quantity_range=[1, 12]):
+# Lowered quantity cap for intermittent/lumpy SKUs. The default [1,12] sampler
+# over-sizes their orders (~2.4x/1.7x vs empirical demand: e.g. burst-1 SKUs
+# such as 3076 receiving 9-10 units, triggering spurious repeated
+# replenishment). Capping these patterns to [1,4] matches their historical
+# order-size median (~2) while smooth/erratic keep the full [1,12] range so the
+# bulk of unit demand — and the genuine replenishment pressure — is preserved.
+INTERMITTENT_LUMPY_RANGE = [1, 4]
+
+# index (= item_id used by the generator) -> demand_pattern, built lazily.
+_PATTERN_BY_ITEM = None
+
+
+def _pattern_by_item():
+    global _PATTERN_BY_ITEM
+    if _PATTERN_BY_ITEM is not None:
+        return _PATTERN_BY_ITEM
+    items_path = os.path.join(parent_directory, 'items.csv')
+    dict_path  = os.path.join(parent_directory, 'items_dictionary.csv')
+    items = pd.read_csv(items_path, index_col=False)
+    items['item_code'] = items['item_code'].astype(str)
+    d = pd.read_csv(dict_path)
+    d['item_code'] = d['item_code'].astype(str)
+    merged = items.merge(d[['item_code', 'demand_pattern']], on='item_code', how='left')
+    _PATTERN_BY_ITEM = merged['demand_pattern'].fillna('smooth').to_dict()
+    return _PATTERN_BY_ITEM
+
+
+def get_random_quantity(quantity_range=[1, 12], item_id=None):
 
     ## Generate a random quantity based on a normal distribution
     ## Even quantities are favored
+
+    # intermittent/lumpy SKUs use a lower cap (their orders are small bursts);
+    # smooth/erratic keep the caller-provided range.
+    if item_id is not None:
+        pat = _pattern_by_item().get(item_id)
+        if pat in ('intermittent', 'lumpy'):
+            quantity_range = INTERMITTENT_LUMPY_RANGE
 
     # Define the quantities from min to max
     min_qty = quantity_range[0]
@@ -87,7 +121,12 @@ def gen_backlog(initial_order, total_requested_item, items_orders_class_configur
         # print(keys, thresholds)
 
         orders_in_backlog = list(i * -1 for i in range(1, initial_order+1))
-        items_in_order = np.random.geometric(0.2, size=initial_order)
+        # SKUs per order ~ Geometric(p): mean = 1/p. p=0.2 → ~5 SKU/order (was 0.3 →
+        # 3.3). Larger orders deplete more SKUs together, so more SKUs go critical in
+        # the same pod/event → the opportunity score has several critical SKUs to rank
+        # (and one trip refills several) instead of 1-SKU-per-trip. Keep in sync with
+        # gen_order below.
+        items_in_order = np.random.geometric(0.3, size=initial_order)
         # print(orders_in_backlog, items_in_order)
 
         orders_backlog = pd.DataFrame(columns=[ 'order_id', 
@@ -125,7 +164,7 @@ def gen_backlog(initial_order, total_requested_item, items_orders_class_configur
                 item_available = item_available.index.to_list()
                 if len(item_available) > 0:
                     item_id = np.random.choice(item_available, p=item_probability)
-                    qty = get_random_quantity(quantity_range=quantity_range)
+                    qty = get_random_quantity(quantity_range=quantity_range, item_id=item_id)
                     order_arrival = 0
                     item_exist.append(item_id)
                     # print("    ", item_id, qty, class_item)
@@ -235,7 +274,9 @@ def gen_order(order_cycle_time,
 
         arrival_times_list = [60 * x for x in arrival_times_list] # convert to seconds
         orders = range(0, len(arrival_times_list))
-        items_in_order = np.random.geometric(0.2, size=len(orders))
+        # SKUs per order ~ Geometric(p=0.2) → ~5 SKU/order (kept in sync with
+        # gen_backlog above). See note there.
+        items_in_order = np.random.geometric(0.3, size=len(orders))
 
         database_order = pd.DataFrame(columns=['order_dum', 
                                                'order_type', 
@@ -278,7 +319,7 @@ def gen_order(order_cycle_time,
                 item_available = item_available.index.to_list()
                 if len(item_available) > 0:
                     item_id = np.random.choice(item_available, p=item_probability)
-                    qty = get_random_quantity(quantity_range=quantity_range)      
+                    qty = get_random_quantity(quantity_range=quantity_range, item_id=item_id)
                     item_exist.append(item_id)
                     # print("    ", item_id, qty, class_item)
 

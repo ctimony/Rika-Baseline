@@ -3,35 +3,48 @@
 ============================
 Rebuilds items_dictionary.csv from clean pipeline outputs.
 
-Initial inventory formula:
-  initial_qty = mean_daily_demand * cov_days + Z * std_daily_demand * sqrt(cov_days)
+Initial inventory & ROP — distribution & horizon by demand pattern.
+============================================================================
+Both initial_qty and rop_global are built from the SAME per-pattern
+distribution; they differ only in the COVERAGE HORIZON. This keeps the two
+quantities methodologically consistent (no SKU is born already below its ROP).
 
-Coverage days per ABC × demand pattern:
-  A: smooth/erratic=1, intermittent=3, lumpy=4
-  B: smooth/erratic=2, intermittent=4, lumpy=5
-  C: smooth/erratic=3, intermittent=5, lumpy=5
+Initial inventory covers ONE DAY (24 h) of demand for every pattern; the two
+quantities still share the same per-pattern distribution and differ only in the
+coverage horizon (24 h for initial, the lead time for ROP).
 
-Z score per ABC × CV class:
-  A × CV0 : 2.33 (99%)    B × CV0 : 1.64 (95%)    C × CV0 : 1.28 (90%)
-  A × CV1 : 1.64 (95%)    B × CV1 : 1.64 (95%)    C × CV1 : 1.28 (90%)
-  A × CV2 : 1.28 (90%)    B × CV2 : 1.28 (90%)    C × CV2 : 1.28 (90%)
+Smooth / Erratic — Normal lead-time-demand (Pinçe et al. 2021 §3.1;
+  Syntetos & Boylan 2005). Demand is frequent, so the CLT holds and the mean
+  is a reliable parameter. Statistics in qty-per-hour (mean_hourly, std_hourly
+  from 02_clean_orders.csv, zero-filled across all 24 hours).
+    initial_qty = ceil( μ_h·H + Z·σ_h·√H ),  H = 24 h (one day)
+    rop_global  = round( μ_h·1 + Z·σ_h·√1 ),  L = 1 h
 
-ROP — distribution-fitting by demand pattern (lead time L = 1/8 day):
-  ROP = F⁻¹(service level), with lead-time demand μ(L)=μ·L, σ²(L)=σ²·L
+Intermittent / Lumpy — count distribution over BURST SIZE. mean_hourly is
+  diluted to ≈0 across 24 h (most hours empty), so it is useless as a base-
+  stock parameter. Instead we use the conditional (non-zero) demand statistics
+  — the burst size — exactly the µ_i = E[y|y>0], σ²_i = Var(y|y>0) of
+  Kronekvist & Titrouq (2026, Eq. 14). The 24-h coverage is converted into the
+  EXPECTED NUMBER OF BURSTS that fire in a day, n_act/day = (active SKU-hour
+  cells) / (number of days), so the count horizon equals one calendar day:
+    z_b   = mean(qty | qty>0)   over active (SKU,date,hour) cells   [burst size]
+    s²_b  = var (qty | qty>0)
+    n_d   = n_act/day            [expected bursts per day]
+    rop_global  = count_ppf(   z_b,    s²_b, SL)   horizon = 1 burst
+    initial_qty = count_ppf( n_d·z_b, n_d·s²_b, SL),  horizon = 1 day (n_d bursts),
+                  floored at rop_global
+  count_ppf fits Negative Binomial when var > mean (overdispersed — "best
+  option ... as it allows for greater variability", Pinçe §3.1.3), else Poisson.
+  This applies a count distribution DIRECTLY to the burst statistics, avoiding
+  the Normal lead-time-demand approximation that Kronekvist & Titrouq (§5.11)
+  flag as unsuitable for highly lumpy / intermittent items.
 
-  Smooth / Erratic — Normal (Pinçe et al. 2021 §3.1; Syntetos & Boylan 2005):
-    rop = μ·L + Z · σ·sqrt(L)
-
-  Intermittent / Lumpy — count distribution (Pinçe et al. 2021 §3.1.3):
-    Negative Binomial when var(L) > mean(L)  [overdispersed — "best option ...
-      as it allows for greater variability"]; method of moments for (r, p).
-    Poisson when var(L) ≤ mean(L)  [equidispersed, near-constant demand size].
-
-  minimum ROP = 1
+  minimum = 1 everywhere.
 
 Inputs:
   data_mining/output/01_clean_skus_pod3.csv
   data_mining/output/04_cv_classification.csv
+  data_mining/output/02_clean_orders.csv
 
 Output: items_dictionary.csv  (project root)
 """
@@ -41,27 +54,21 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm, nbinom, poisson
 
-ROOT      = os.path.dirname(os.path.abspath(__file__))
-SKUS_PATH = os.path.join(ROOT, "output", "01_clean_skus_pod3.csv")
-CV_PATH   = os.path.join(ROOT, "output", "04_cv_classification.csv")
+ROOT       = os.path.dirname(os.path.abspath(__file__))
+SKUS_PATH  = os.path.join(ROOT, "output", "01_clean_skus_pod3.csv")
+CV_PATH    = os.path.join(ROOT, "output", "04_cv_classification.csv")
+ORDERS_PATH = os.path.join(ROOT, "output", "02_clean_orders.csv")
 OUT_PATH  = os.path.join(ROOT, "..", "items_dictionary.csv")
 
 POD3_SLOT_VOL = 60_000  # cm³
 
-COVERAGE_DAYS = {
-    ("A", "smooth"):       1,
-    ("A", "erratic"):      1,
-    ("A", "intermittent"): 2,
-    ("A", "lumpy"):        3,
-    ("B", "smooth"):       2,
-    ("B", "erratic"):      2,
-    ("B", "intermittent"): 3,
-    ("B", "lumpy"):        4,
-    ("C", "smooth"):       3,
-    ("C", "erratic"):      3,
-    ("C", "intermittent"): 4,
-    ("C", "lumpy"):        4,
-}
+# ── Coverage horizons (per demand pattern) ─────────────────────────────────
+# Initial stock covers one calendar day (24 h) for every pattern. Smooth/erratic
+# use 24 hours of Normal demand directly; intermittent/lumpy convert the 24-h day
+# into n_act/day bursts of burst-size demand. ROP is the lead time (1 h / 1 burst).
+INIT_HORIZON_SE_HOURS = 24   # smooth/erratic initial stock = one day
+ROP_HORIZON_SE_HOURS  = 1.0    # smooth/erratic ROP lead time = 1 hour
+ROP_HORIZON_IL_BURSTS  = 3   # intermittent/lumpy ROP = 1 burst
 
 # Service level (Z) is a function of ABC class ONLY — a proxy for item
 # criticality (A items most critical → highest availability), per standard
@@ -70,16 +77,64 @@ COVERAGE_DAYS = {
 # intermittent SKUs (high cv from sparsity, not size variability). Demand-size
 # variability (CV²) instead enters through the lead-time demand DISTRIBUTION
 # (Poisson vs Negative Binomial, chosen by dispersion), per Boylan & Syntetos.
-#   A: 99% service level (Z = 2.3263)
-#   B: 95% service level (Z = 1.6449)
-#   C: 90% service level (Z = 1.2816)
-Z_MAP = {
-    "A": norm.ppf(0.99),  # 2.3263
-    "B": norm.ppf(0.95),  # 1.6449
-    "C": norm.ppf(0.90),  # 1.2816
+# Service level is set jointly by ABC class AND demand pattern, mirroring the
+# (cluster × CV-class) scheme of Chou et al. (Table 4.5). The service level falls
+# as demand becomes less regular within a class, because guaranteeing a high
+# service level for sporadic demand is uneconomical and rests on an unreliable σ
+# estimate (Silver, Pyke & Peterson 1998; Boylan & Syntetos). The four demand
+# patterns (smooth/erratic/intermittent/lumpy) map onto Chou's three CV-classes:
+#   smooth     → "stable"      (CV0)
+#   erratic    → "volatile"    (CV1)
+#   intermittent / lumpy → "intermittent" (CV2)
+# As in Chou, irregular A items drop to 95%, irregular B items to 90%, and C
+# (always intermittent in this dataset) stays at 90% — the floor.
+#   A-smooth          : 99%  (Z = 2.3263)   A-volatile/intermittent : 95% / 90%
+#   B-regular         : 95%                 B-intermittent          : 90%
+#   C                 : 90%
+SL_MAP = {
+    ("A", "smooth"):       0.99,
+    ("A", "erratic"):      0.95,
+    ("A", "intermittent"): 0.90,
+    ("A", "lumpy"):        0.90,
+    ("B", "smooth"):       0.95,
+    ("B", "erratic"):      0.95,
+    ("B", "intermittent"): 0.90,
+    ("B", "lumpy"):        0.90,
+    ("C", "smooth"):       0.90,
+    ("C", "erratic"):      0.90,
+    ("C", "intermittent"): 0.90,
+    ("C", "lumpy"):        0.90,
 }
 
-LEAD_TIME_ROP = 0.5 / 8  # 1 shift-hour (default)
+
+def get_service_level(cls, pat):
+    """Service level for an (ABC class, demand pattern) pair (Chou Table 4.5).
+    Falls back to 0.90 (C floor) for any unclassified combination."""
+    return SL_MAP.get((str(cls), str(pat)), 0.90)
+
+
+def get_z(cls, pat):
+    """Safety-stock multiplier Z = Φ⁻¹(service level) for the (class, pattern)."""
+    return norm.ppf(get_service_level(cls, pat))
+
+def count_ppf(mu, var, sl):
+    """Service-level quantile of a count distribution fitted by dispersion.
+
+    Negative Binomial (method of moments) when overdispersed (var > mu), else
+    Poisson (Pinçe et al. 2021 §3.1.3). Used for intermittent/lumpy demand,
+    where mu/var are the burst-size statistics scaled by the burst horizon.
+    """
+    if mu <= 0:
+        return 1
+    if var > mu:
+        r = mu ** 2 / (var - mu)
+        p = r / (r + mu)
+        q = nbinom.ppf(sl, n=r, p=p)
+    else:
+        q = poisson.ppf(sl, mu=mu)
+    if not np.isfinite(q):
+        return 1
+    return max(1, int(q))
 
 
 def main():
@@ -122,70 +177,135 @@ def main():
     # ── Rename abc_class → item_class ─────────────────────────
     df = df.rename(columns={"abc_class": "item_class"})
 
-    # ── Initial inventory ──────────────────────────────────────
-    def compute_initial_qty(row):
-        mu    = float(row["mean_daily_demand"])
-        sigma = float(row["std_daily_demand"])
-        cls   = str(row["item_class"])
-        cv_c  = int(row["cv_class"])
-        pat   = str(row["demand_pattern"])
-        cov   = COVERAGE_DAYS.get((cls, pat), COVERAGE_DAYS.get(("C", pat), 4))
-        z     = Z_MAP.get(cls, Z_MAP["C"])  # fallback: unclassified -> C (90%), consistent with fillna("C")
-        if mu <= 0:
-            return 1
-        rop_1day = mu * 1.0 + z * sigma * np.sqrt(1.0)
-        qty = rop_1day * cov
-        return max(1, int(np.ceil(qty)))
+    # ── Recompute item_order_frequency from 02_clean_orders ────
+    # Previously item_order_frequency came from the clean-SKU stage (before the
+    # quantity/volume filters in 02), so it was inconsistent with
+    # mean_daily_demand (which is computed from 02_clean_orders). Recompute it
+    # here from the same source = number of unique orders containing the SKU,
+    # so the order generator (which samples SKUs ∝ item_order_frequency) and the
+    # ROP (∝ mean_daily_demand) are derived from the identical cleaned dataset.
+    orders = pd.read_csv(ORDERS_PATH)
+    orders["item_code"] = orders["item_code"].astype(str)
+    order_freq = orders.groupby("item_code")["order_id"].nunique()
+    df["item_order_frequency"] = (
+        df["item_code"].map(order_freq).fillna(0).astype(int)
+    )
 
-    df["item_initial_quantity_inventory"] = df.apply(compute_initial_qty, axis=1)
+    # ── Hourly demand statistics for ROP ──────────────────────
+    # Aggregate qty per (SKU, date, hour), zero-fill hours with no transactions,
+    # then compute mean and std across all (date, hour) observations per SKU.
+    # This gives demand statistics in units of "qty per hour", consistent with
+    # LEAD_TIME_ROP = 1 hour.
+    orders["order_date"] = pd.to_datetime(orders["order_date"])
+    orders["date"] = orders["order_date"].dt.date
+    orders["hour"] = orders["order_date"].dt.hour
+    all_dates = sorted(orders["date"].unique())
+    all_hours = list(range(24))
+    all_order_skus = orders["item_code"].unique()
+    hourly_qty = (
+        orders.groupby(["item_code", "date", "hour"])["item_quantity"].sum()
+        .reindex(
+            pd.MultiIndex.from_product(
+                [all_order_skus, all_dates, all_hours],
+                names=["item_code", "date", "hour"],
+            ),
+            fill_value=0,
+        )
+    )
+    mean_hourly_series = hourly_qty.groupby("item_code").mean()
+    std_hourly_series  = hourly_qty.groupby("item_code").std(ddof=1).fillna(0)
+    df["mean_hourly_demand"] = df["item_code"].map(mean_hourly_series).fillna(0.0)
+    df["std_hourly_demand"]  = df["item_code"].map(std_hourly_series).fillna(0.0)
+
+    # ── Burst-size statistics (intermittent / lumpy) ──────────────
+    # Conditional (non-zero) demand statistics over active (SKU,date,hour)
+    # cells: z_b = E[qty | qty>0] (burst size), s2_b = Var[qty | qty>0].
+    # These are the µ_i, σ²_i of Kronekvist & Titrouq (2026, Eq. 14). For
+    # intermittent/lumpy SKUs the diluted mean_hourly is ≈0, so the burst
+    # statistics — not the hourly mean — drive the count-distribution ROP and
+    # initial stock (horizon measured in bursts).
+    active = (
+        orders.groupby(["item_code", "date", "hour"])["item_quantity"].sum()
+        .reset_index()
+    )
+    zb_series  = active.groupby("item_code")["item_quantity"].mean()
+    s2b_series = active.groupby("item_code")["item_quantity"].var(ddof=1).fillna(0.0)
+    df["burst_size"]     = df["item_code"].map(zb_series).fillna(0.0)
+    df["burst_size_var"] = df["item_code"].map(s2b_series).fillna(0.0)
+
+    # Expected bursts per day, n_act/day = (active SKU-hour cells) / (#days).
+    # Used as the count horizon for intermittent/lumpy initial stock (one day).
+    n_days = max(1, len(all_dates))
+    n_act_series = active.groupby("item_code")["item_quantity"].size() / n_days
+    df["n_act_per_day"] = df["item_code"].map(n_act_series).fillna(0.0)
 
     # ── ROP global ─────────────────────────────────────────────
-    # Distribution-fitting approach (Pinçe et al. 2021; Syntetos et al. 2005;
-    # Teunter & Duncan 2009). Demand pattern (from ADI & CV²) selects the
-    # lead-time demand distribution; ROP = F⁻¹(service level).
-    #
-    #   Smooth / Erratic   : Normal       — regular demand (Pinçe §3.1)
-    #   Intermittent/Lumpy : Negative Binomial when overdispersed (var > mean)
-    #                        — "best option is the negative binomial distribution,
-    #                        as it allows for greater variability" (Pinçe §3.1.3).
-    #                        Poisson when var ≤ mean (equidispersed demand sizes).
-    #
-    # Lead-time extrapolation (Pinçe §3): μ(L) = μ·L, σ²(L) = σ²·L
+    # Same per-pattern distribution as initial stock; horizon = 1 (hour or
+    # burst). See module docstring.
+    #   Smooth / Erratic   : Normal,  rop = μ_h·L + Z·σ_h·√L,  L = 1 h
+    #   Intermittent/Lumpy : count_ppf over burst size, horizon = 1 burst
     def compute_rop(row):
-        mu    = float(row["mean_daily_demand"])
-        sigma = float(row["std_daily_demand"])
-        pat   = str(row["demand_pattern"])
-        cls   = str(row["item_class"])
-        cv_c  = int(row["cv_class"])
-        z     = Z_MAP.get(cls, Z_MAP["C"])  # fallback: unclassified -> C (90%), consistent with fillna("C")
-        sl    = norm.cdf(z)        # service level probability from Z
-        L     = LEAD_TIME_ROP
-
-        if mu <= 0:
-            return 1
+        pat = str(row["demand_pattern"])
+        cls = str(row["item_class"])
+        sl  = get_service_level(cls, pat)
 
         if pat in ("smooth", "erratic"):
-            # Normal distribution — standard formula for regular demand
-            rop = mu * L + z * sigma * np.sqrt(L)
+            mu_h  = float(row["mean_hourly_demand"])
+            sig_h = float(row["std_hourly_demand"])
+            if mu_h <= 0:
+                return 1
+            L   = ROP_HORIZON_SE_HOURS
+            rop = mu_h * L + norm.ppf(sl) * sig_h * np.sqrt(L)
             return max(1, int(np.round(rop)))
 
-        # Intermittent / Lumpy — count distribution fitted to lead-time demand
-        mu_L  = mu * L                  # mean lead-time demand
-        var_L = (sigma ** 2) * L        # variance lead-time demand
-
-        if var_L > mu_L:
-            # Negative Binomial via method of moments (overdispersed)
-            #   var = μ + μ²/r  →  r = μ²/(var − μ),  p = r/(r + μ)
-            r = mu_L ** 2 / (var_L - mu_L)
-            p = r / (r + mu_L)
-            rop = nbinom.ppf(sl, n=r, p=p)
-        else:
-            # Poisson (equidispersed: var ≤ mean, near-constant demand size)
-            rop = poisson.ppf(sl, mu=mu_L)
-
-        return max(1, int(np.round(rop)))
+        # Intermittent / Lumpy — count distribution over ONE full demand event
+        # (1 burst). Because replenishment is TRIGGERED by a demand occurrence, the
+        # ROP must cover at least one full demand event (Teunter & Duncan 2009); a
+        # sub-event ROP is meaningless for sporadic demand whose per-hour rate ≈ 0.
+        # ROP_IL is therefore FIXED at one burst (independent of lead time): the
+        # lead-time knob (ROP_HORIZON_SE_HOURS) varies the SE reorder point only,
+        # since SE demand is regular enough for an hours-based lead time to be
+        # meaningful, whereas IL demand is event-based. This keeps the IL reorder
+        # rule simple and standard, and (as the trigger log shows) SE SKUs drive the
+        # large majority of replenishments, so the lead-time lever remains effective.
+        return count_ppf(float(row["burst_size"]),
+                         float(row["burst_size_var"]), sl)
 
     df["rop_global"] = df.apply(compute_rop, axis=1)
+
+    # ── Initial inventory ──────────────────────────────────────
+    # One day (24 h) of coverage, same per-pattern distribution as ROP.
+    # NOT floored at ROP: initial stock is a fixed 24-h coverage that must stay
+    # CONSTANT when the ROP lead-time horizon (ROP_HORIZON_SE_HOURS / _IL_BURSTS)
+    # is varied for the DoE. Flooring at ROP would let a higher lead-time ROP drag
+    # initial stock (and hence slots_needed / pod allocation) up — coupling the
+    # lead-time knob to stock & layout. We want lead time to move ROP (the reorder
+    # TRIGGER) ONLY, so the initial stock / pod layout are identical across lead-time
+    # scenarios and the comparison isolates the trigger.
+    #   Smooth / Erratic   : Normal over H = 24 h (one day)
+    #   Intermittent/Lumpy : count_ppf over n_act/day bursts of burst size (one day)
+    def compute_initial_qty(row):
+        pat = str(row["demand_pattern"])
+        cls = str(row["item_class"])
+        sl  = get_service_level(cls, pat)
+
+        if pat in ("smooth", "erratic"):
+            mu_h  = float(row["mean_hourly_demand"])
+            sig_h = float(row["std_hourly_demand"])
+            if mu_h <= 0:
+                return 1
+            H   = INIT_HORIZON_SE_HOURS
+            qty = mu_h * H + norm.ppf(sl) * sig_h * np.sqrt(H)
+            return max(int(np.ceil(qty)), 1)
+
+        # Intermittent / Lumpy — count distribution over one day = n_act/day bursts.
+        # At least one burst of coverage even if n_act/day rounds toward zero.
+        k   = max(1.0, float(row["n_act_per_day"]))
+        qty = count_ppf(k * float(row["burst_size"]),
+                        k * float(row["burst_size_var"]), sl)
+        return max(qty, 1)
+
+    df["item_initial_quantity_inventory"] = df.apply(compute_initial_qty, axis=1)
 
     # ── slots_needed = ceil(initial_qty / max_qty_per_slot) ────
     df["max_qty_per_slot"] = (
@@ -207,6 +327,8 @@ def main():
         "item_class",
         "item_initial_quantity_inventory",
         "mean_daily_demand", "std_daily_demand", "cv",
+        "mean_hourly_demand", "std_hourly_demand",
+        "burst_size", "burst_size_var", "n_act_per_day",
         "adi", "cv2", "demand_pattern", "cv_class",
         "rop_global", "slots_needed",
     ]

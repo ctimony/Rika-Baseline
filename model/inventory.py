@@ -39,10 +39,9 @@ pd.set_option('display.max_colwidth', None)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)  # Let it auto-expand
 
-USE_OPPORTUNITY_SCORE = False     # True = Proactive ORS (300 ticks), False = baseline AND gate with pod index
-REPLENISHMENT_THETA = 0.4      # OBR gate: dispatch when pod_gap >= THETA*(1 - urgency_max)
-BASELINE_KL = 0.4              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline). Lowered 0.4->0.2: verified Q_p (ΣU_ip flagged / |n_p| cap 6) ≈ 0.1-0.3, so KL=0.4 stalled the AND baseline; KL=0.2 lets it fire on its own logic.
-BASELINE_UL = {'A': 0.4, 'B': 0.5, 'C': 0.6}  # Layer 1 utilization threshold per ABC class
+USE_OPPORTUNITY_SCORE = True     # True = Proactive ORS, False = baseline AND/OR gate with pod index
+BASELINE_KL = 0.4              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline). UL 0.6 + KL 0.4 = stable zone (cf. Yohana Table 4.9 scenario 18).
+BASELINE_UL = {'A': 0.6, 'B': 0.6, 'C': 0.6}  # Layer 1 utilization threshold per ABC class
 # Baseline version (only used when USE_OPPORTUNITY_SCORE = False):
 #   1 = AND/cascade with both layers required: a SKU must pass Layer 1 (flagged) AND
 #       the pod must pass Layer 2 (Q_p >= KL). Needs the stockout override (Layer 1+2
@@ -56,12 +55,19 @@ BASELINE_VERSION = 1
 # the AND baseline runs on its own logic ONLY (no override) — used to show the
 # baseline stalls / under-replenishes without the net. When True, the net catches
 # SKUs that hit zero stock as a last-resort floor.
-STOCKOUT_OVERRIDE_ENABLED = True
+STOCKOUT_OVERRIDE_ENABLED = False
+# v13 stockout safety net (DEADLOCK GUARD). Separate from the baseline override above.
+# When True and v13 is active, every scan interval we fetch ONE pod for each SKU whose
+# WAREHOUSE stock is truly zero (current_global_qty == 0) and is still fillable — so a
+# SKU that has gone to true global stockout (and whose pod never passes picking, e.g.
+# when V13_ALLOW_FETCH is False) cannot leave orders hanging forever. It fires ONLY on
+# true zero-stock (not on the opportunity score), identically across all weights, so it
+# does not distort the weight comparison / Pareto front. Every firing is counted
+# (self._v13_net_fetches) so the contamination can be quantified and reported.
+V13_STOCKOUT_NET = False
 # ORS version (only used when USE_OPPORTUNITY_SCORE = True):
-#   2 = simple ORS: evaluate ONLY the just-picked pod (extra_pod); if it passes the
-#       theta gate, dispatch it directly. No candidate search, no ranking.
 #   6 = TWO-LEVEL ROP (pod-local): trigger over the just-picked SKUs; a SKU is
-#       critical iff current_global <= rop_global AND current_in_pod <= rop_per_pod.
+#       critical iff current_global <= rop_global AND slot_stock <= rop_per_slot.
 #       If any is critical, replenish the just-picked pod directly. No candidate
 #       search, no ranking. Cheapest mechanism — minimises trips (robot-bound).
 #   7 = OPPORTUNITY SCORE + RPS (Replenishment Pod Selection, "check other pods"):
@@ -78,18 +84,56 @@ STOCKOUT_OVERRIDE_ENABLED = True
 #       hand); otherwise a robot retrieves the chosen pod from storage (RPS, a
 #       standard RMFS decision). Selecting another pod only when its score is clearly
 #       higher keeps the extra retrieval trips worthwhile in the robot-bound regime.
-ORS_VERSION = 6
-# Experimental extreme lower-bound point (v6): when True, the per-pod trigger fires
-# ONLY when the slot is fully depleted (current_in_pod == 0) — i.e. ROP_per_pod = 0,
+#  10 = REACTIVE after picking (Tracy-style, but with opportunity score):
+#       TRIGGER: only just-picked SKUs checked against rop_global. If any newly
+#       crosses ROP, evaluate ALL idle pods (including just-picked pod) that carry
+#       any globally-critical SKU. Score: Σ pending(s) × (1 - current_pod(s)/limit_pod(s))
+#       over all critical SKUs in the pod. No rop_per_slot gate. Pod with highest
+#       score dispatched; if just-picked pod wins, it goes directly (no extra trip).
+#   8 = CriticalDemandCoverage × TotalRefillGap over IDLE pods, event-driven fetch.
+#   9 = opportunity-SCORED ranking (Σ pending·urgency) over IDLE pods, event-driven fetch.
+ORS_VERSION = 13             # active: v12 (opportunity score, multiplicative); proposed policy
+#  13 = weighted-sum opportunity score: Score = W_G·g(urgency) + W_E·emptiness
+#       (event-driven, evaluated at finish-picking). The two weights trade off
+#       service (anti-stockout) vs trip-efficiency; vary them for a Pareto front.
+V13_W_G = 0.5                # weight on g (urgency / anti-stockout)   — vary for Pareto
+V13_W_E = 0.5                # weight on emptiness (trip-efficiency)   — V13_W_G + V13_W_E = 1
+# FILL RATE: at the replenishment station, refill each TRIGGERING (critical) SKU up to
+# V12_FILL_RATE × limit_qty (only those SKUs, not the whole pod). 1.0 = full; <1 leaves
+# slots partly filled → lower pod mass → lower travel energy (prof's energy lever).
+# Vary {0.7, 0.8, 1.0} as a DoE factor for the energy↔replenishment-frequency trade-off.
+V12_FILL_RATE = 0.9
+# WHOLE-POD FILL: when True, a replenishment trip refills EVERY SKU in the pod (up to
+# V12_FILL_RATE × limit), not only the critical SKUs that triggered the trip. Since the
+# pod is already at the replenishment station, topping up all its SKUs ('free-ride')
+# raises pile-on and makes the pod stay full longer → fewer re-triggers / fewer trips,
+# at the cost of higher pod mass (energy) and cross-SKU contamination of the per-SKU
+# replenishment pattern. This is Kuo's proposed-policy behaviour (restock the whole
+# selected pod to max). False = critical-only (cleaner per-SKU, more trips).
+V12_FILL_WHOLE_POD = True
+# Score_p = W_G·g_pod + W_E·emptiness_pod, where
+#   g_pod        = MAX over the pod's CRITICAL SKUs of (rop_global−cur_global)/rop_global
+#                  — how close the most-critical SKU is to a WAREHOUSE stockout (service).
+#   emptiness_pod= 1 − (Σ current_qty / Σ limit_qty) over ALL SKUs in the pod — how empty
+#                  the pod is overall (a replenish trip refills the WHOLE pod, so trip
+#                  worth depends on the whole-pod deficit). Trip-efficiency.
+# FETCH toggle: when V13_ALLOW_FETCH is False, a non-picked (idle) winner is NOT fetched
+#   — it is left to be served the next time it passes through picking. This makes every
+#   replenishment a PIGGYBACK (zero fetch trips) across ALL weights, so the trip count
+#   differs only by which picked pods get piggybacked → a clean weight comparison.
+V13_ALLOW_FETCH = True
+# v8/v9 replenishment is EVENT-DRIVEN (decided when a free robot asks for a task,
+# the WES robot life-cycle decision point of Bolu & Korçak 2021) — no periodic scan
+# cadence. A pod is dispatched only if it carries SKUs critical at BOTH the global
+# (current_global ≤ rop_global, net of in-flight reservations) AND per-pod
+# (slot_stock ≤ rop_per_slot) levels; in-flight reservation prevents a second pod
+# being sent for a SKU already covered by an en-route pod.
+# Experimental extreme lower-bound point (v6): when True, the per-slot trigger fires
+# ONLY when the slot is fully depleted (slot_stock == 0) — i.e. ROP_per_slot = 0,
 # no safety stock, reorder only after stockout. Used to map the bottom of the L/ROP
 # trade-off curve (proves a positive ROP / ~30 min lead time is better). NOT a
 # realistic operating policy — a theoretical worst-case reference.
 TRIGGER_ON_EMPTY_ONLY = False
-# OBR v3 lever W (service <-> efficiency), 0..1:
-#   W high -> efficiency (prefer empty pods / total_space, fewer trips)
-#   W low  -> service    (prefer pods whose critical SKU is most urgent per-pod)
-REPLENISHMENT_W = 0.8
-
 class Inventory(Universe):
     dimension = 60
     map = []
@@ -144,10 +188,17 @@ class Inventory(Universe):
 
         self.priority_order = False
         self._stockout_skus: set = set()  # rebuilt every tick
+        self._v13_net_fetches = 0  # count of v13 stockout-net (deadlock-guard) fetches
         self.skus_replenished_count = 0  # total SKU slots refilled across all replenishment trips
         # Diagnostic: why does an order wait? (bottleneck attribution)
         self._wait_stockout = 0  # times PPS found no pod that can contribute (SKU depleted)
         self._wait_robot = 0     # times a pod was found but no idle robot to carry it
+        # Stockout Count (performance metric): UNIQUE (order_id, sku) order lines that
+        # encounter a true stockout — warehouse stock of the requested SKU is zero
+        # (i.e. all pods storing it are empty, per Lamballais et al. 2018) at the moment
+        # the order line is processed. Counted once per order-line (a set), unlike
+        # _wait_stockout which accumulates every processing tick.
+        self._stockout_orderlines = set()
 
         if self.poa_second:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -180,19 +231,35 @@ class Inventory(Universe):
         # Reset movement tracking
         self.movement_channel = {}
 
-        # Stockout safety net (AND baseline only) — scan every 600 s (10 min) for SKUs
-        # that have ACTUALLY hit zero global stock and dispatch a pod to refill them.
-        # With the AND baseline firing on its own logic (KL=0.2, cap=6), this net is a
-        # last-resort floor against true stockout, NOT the primary driver. The OR
-        # baseline (v2) needs no net; OBR has none either.
+        # Stockout safety net (AND baseline only) — scan every 3600 s for SKUs that have
+        # ACTUALLY hit zero global stock and dispatch a REAL robot trip (a pod carrying the
+        # stocked-out SKU is fetched to a replenishment station, refilling ONLY the critical
+        # stocked-out SKU on arrival). This is a robot-travel trip COUNTED in the trip/energy
+        # metrics — the same cost basis as the v13 fetch that handles stockouts on the
+        # opportunity-score side — so baseline and ORS pay the same price for a stockout
+        # recovery, keeping the comparison fair.
         if STOCKOUT_OVERRIDE_ENABLED and not USE_OPPORTUNITY_SCORE and BASELINE_VERSION == 1:
-            if int(self._tick) % 600 == 0:
+            if int(self._tick) % 3600 == 0:
                 self._stockout_skus = {
                     sku for sku, data in self.pod_manager.skus_data.items()
                     if data.get('current_global_qty', 1) == 0
                 }
             if self._stockout_skus:
-                self._dispatch_stockout_pods()
+                self._dispatch_stockout_pods()        # robot travel (real trip), not instant
+
+        # v13 stockout safety net (deadlock guard) — same scan as the baseline net, but
+        # gated on v13 being active. Fires ONLY for true zero-stock SKUs, identically
+        # across all weights, so it does not distort the weight comparison.
+        if V13_STOCKOUT_NET and USE_OPPORTUNITY_SCORE and ORS_VERSION in (12, 13):
+            if int(self._tick) % 3600 == 0:
+                self._stockout_skus = {
+                    sku for sku, data in self.pod_manager.skus_data.items()
+                    if data.get('current_global_qty', 1) == 0
+                }
+            if self._stockout_skus:
+                self._dispatch_stockout_pods()        # robot travel (real trip) — SAME cost
+                                                       # basis as the baseline stockout override,
+                                                       # so v12/v13 and baseline are fair.
 
         # Process orders at scheduled intervals
         if int(self._tick) == self.next_process_tick:
@@ -201,8 +268,43 @@ class Inventory(Universe):
             self.process_orders()
             if self.update_intersection_using_RL:
                 self.intersection_manager.update_allowed_direction_using_q_model(int(self._tick))
-
         print(f"Current job queue length: {len(self.job_queue)}")
+
+        # v8/v9 REPLENISHMENT — EVENT-DRIVEN (after the WES robot life-cycle of Bolu &
+        # Korçak 2021): replenishment is decided at the moment a robot is free and asks
+        # for a task — the standard WES decision point — NOT by periodic scanning. This
+        # avoids imposing a separate continuous decision loop on the warehouse execution
+        # system while staying responsive to SKU depletion. When a robot is free, if a
+        # pod carrying two-level-critical SKUs (needed by waiting orders) exists, the
+        # robot is sent to replenish the best such pod instead of picking; in-flight
+        # reservation prevents two pods being sent for the same SKU.
+        #   v9 = opportunity-SCORED ranking (Σ pending·urgency), fetch only;
+        #   v8 = CriticalDemandCoverage × TotalRefillGap over IDLE pods only,
+        #        dispatches all worthwhile pods this tick (each fetched by a robot);
+        #   v7 = PIGGYBACK (finish_picking, no fetch) + FETCH for the rest — both use
+        #        the v9 opportunity score; the per-tick scan below is v7's FETCH half.
+        # v12 is EVENT-DRIVEN (decided at finish-picking in finish_picking_task), so there
+        # is NO periodic scan here — it evaluates only when a pod finishes picking.
+        if USE_OPPORTUNITY_SCORE and ORS_VERSION in (8, 9):
+            self._dispatch_replenishment_event(use_score=(ORS_VERSION == 9))
+        elif USE_OPPORTUNITY_SCORE and ORS_VERSION == 10:
+            # v10 = continuous-review SCAN-FETCH every tick: build the ROP-global critical
+            # set, rank ALL idle pods by the v10 opportunity score (Σ g_i·(1−cur/lim)·pending)
+            # and greedily fetch worthwhile pods (bounded by free robots / station capacity).
+            # No piggyback, no stockout override.
+            # (v11 and v12 do NOT scan per tick — they evaluate ONLY at finish-picking;
+            #  v11 = greedy multi-dispatch, v12 = one pod per picking event.)
+            self._dispatch_replenishment_event(use_score=True)
+        elif USE_OPPORTUNITY_SCORE and ORS_VERSION == 7:
+            # v7 = PIGGYBACK (decided at finish-picking, no fetch) + FETCH for the rest.
+            # The piggyback in finish_picking_task serves critical pods that happen to
+            # pass through picking for free; this event-driven scan fetches the best
+            # IDLE pod for critical+awaited SKUs that did NOT pass through picking. Both
+            # use the SAME opportunity score (_v9_pod_score via use_score=True), and the
+            # in-flight reservation set is shared, so a SKU already covered by a piggyback
+            # pod is not fetched again. Dispatch only consumes a free robot, so picking is
+            # not starved.
+            self._dispatch_replenishment_event(use_score=True)
 
         if len(self.job_queue) > 0:
             job = self.job_queue[0]
@@ -217,6 +319,17 @@ class Inventory(Universe):
                         if dist < current_distance:
                             nearest_robot = o
                             current_distance = dist
+
+                # A queued replenishment fetch may have been queued without a station slot
+                # (station was full at enqueue time). Try to bind a station now; if still
+                # none, leave it queued for a later tick.
+                if nearest_robot is not None and getattr(job, 'station_id', None) is None and job.orders == []:
+                    st = self.station_manager.find_available_replenish_station()
+                    if st is not None:
+                        st.add_pod(job.pod.pod_id)
+                        job.station_id = st.station_id
+                    else:
+                        nearest_robot = None   # keep waiting until a station frees up
 
                 if nearest_robot is not None:
                     self.job_queue.remove(job)  # Remove the selected job from the queue
@@ -240,6 +353,8 @@ class Inventory(Universe):
         total_energy = 0
         total_turning = 0
         total_idle = 0
+        tick_load_mass = 0.0      # total pod mass carried by MOVING robots this tick
+        tick_moving_robots = 0    # how many robots are actually moving this tick
         for o in self.get_movable_objects():
             if isinstance(o, Robot):
                 initial_velocity = o.velocity
@@ -249,10 +364,14 @@ class Inventory(Universe):
                 total_idle += (o.total_idle * 0.15)
                 if o.velocity == 0 and initial_velocity > 0:
                     self.stop_and_go += 1
+                # Diagnostic: mass carried while moving (energy ∝ (mass+load_mass)·v)
+                if o.velocity != 0:
+                    tick_load_mass += getattr(o, 'load_mass', 0.0)
+                    tick_moving_robots += 1
 
                 # Handle job completion and replenishment
                 if o.job is not None and o.job.picking_delay == 0 and not o.job.is_finished:
-                    need_replenish_pod = self.finish_task_in_job(o.job)
+                    need_replenish_pod = self.finish_task_in_job(o.job, robot=o)
                     for triplet in o.job.orders:
                         update_job_task(
                             pod_id=str(o.job.pod.pod_id),
@@ -302,6 +421,8 @@ class Inventory(Universe):
         self.total_robot_idle = total_idle
         self.total_energy = total_energy / 1000  # TEC in kJ (Eq. 3.30); per-robot energy stays in Joule
         self.total_turning = total_turning
+        self._tick_load_mass = tick_load_mass          # diagnostic: mass carried while moving
+        self._tick_moving_robots = tick_moving_robots
 
         # Update process tick and intersection model
         if int(self._tick) == self.next_process_tick:
@@ -318,11 +439,11 @@ class Inventory(Universe):
         #     f.write(f"{result}")
         return [result, station_orders]
 
-    def finish_task_in_job(self, job: RobotJob):
+    def finish_task_in_job(self, job: RobotJob, robot=None):
         job_station = self.station_manager.get_station_by_id(job.station_id)
         if job_station.is_picker_station():
             try:
-                return self.finish_picking_task(job)
+                return self.finish_picking_task(job, robot=robot)
             except Exception as e:
                 print(f"[ERROR] finish_picking_task for job {job.job_id}")
                 print(f"[ERROR] for pod {job.pod} location {job.pod.coordinate}")
@@ -335,10 +456,15 @@ class Inventory(Universe):
                 print(f"[ERROR] for pod {job.pod} location {job.pod.coordinate}")
                 raise e
     
-    def finish_picking_task(self, job: RobotJob):
+    def finish_picking_task(self, job: RobotJob, robot=None):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
-        pod_info_df = pd.read_csv('pod_info.csv')
+        # APPEND-ONLY rows for pod_info: collect this job's picking rows and append at
+        # the end (mode='a', no header). Do NOT read+concat+overwrite the whole file —
+        # picking fires thousands of times and replenishment dozens; the old
+        # read-modify-write race let a picking write overwrite (drop) replenishment
+        # rows committed by another event, undercounting total_replenishments.
+        picking_rows = []
         for order_id, sku, quantity in job.orders:
             order: Order = self.order_manager.get_order_by_id(order_id)
             order.deliver_quantity(sku, quantity)
@@ -348,19 +474,17 @@ class Inventory(Universe):
             assign_order_df.loc[((assign_order_df['order_id'] == order.order_id) & (assign_order_df['item_id'] == sku)), 'status'] = 1
             assign_order_df.loc[((assign_order_df['order_id'] == order.order_id) & (assign_order_df['item_id'] == sku)), 'order_finished'] = int(self._tick)
             assign_order_df.to_csv('assign_order.csv', index=False)
-            new_row = {
+            picking_rows.append({
                 "pod_id": pod.pod_id,
                 "item_id": sku,
                 "qty": quantity,
                 "order_id": order_id,
                 "processed_time": int(self._tick),
                 "task_type": 1,
-                "trigger": None
-            }
+                "trigger": None,
+                "opp_score": None,
+            })
 
-            new_row_df = pd.DataFrame([new_row])
-            pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
-            
             if order.is_order_completed():
                 self.order_manager.finish_order(order_id, int(self._tick))
                 station = self.station_manager.get_station_by_id(order.station_id)
@@ -380,9 +504,56 @@ class Inventory(Universe):
             if replenished_status and sku_out not in sku_need_replenished:
                 sku_need_replenished.append(sku_out)
 
-        pod_info_df.to_csv('pod_info.csv', index=False)
+        if picking_rows:
+            pd.DataFrame(picking_rows, columns=["pod_id", "item_id", "qty", "order_id",
+                "processed_time", "task_type", "trigger", "opp_score"]).to_csv(
+                'pod_info.csv', mode='a', header=False, index=False)
         job.set_job_finish()
         if USE_OPPORTUNITY_SCORE:
+            # v8/v9/v10 decide replenishment in the main loop (scanned every tick); the
+            # just-picked pod simply returns to storage (no piggyback). v10 ranks pods with
+            # the v10 opportunity score (Σ g_i·(1−cur/lim)·pending); this isolates the
+            # SCORE from any piggyback mechanism.
+            if ORS_VERSION in (8, 9, 10):
+                return False
+            # v11 = v10 + PIGGYBACK with RANKED-TOGETHER selection. The just-picked pod is
+            # already in the robot's hands; score it TOGETHER with all idle pods (same v10
+            # score). If the just-picked pod wins, it goes straight to replenishment for
+            # free (no fetch trip); if an idle pod wins, that pod is fetched and the
+            # just-picked pod returns to storage. Reservation is shared with the per-tick
+            # scan so no SKU is double-served. Pods not passing through picking are served
+            # by that scan.
+            if ORS_VERSION == 11:
+                picked_skus = {sku for _, sku, _ in job.orders}
+                return self._dispatch_piggyback_ranked_v11(picked_pod=pod,
+                                                           picking_robot=robot,
+                                                           picked_skus=picked_skus)
+            # v12 = EVENT-DRIVEN at finish-picking: rank the just-picked pod (and idle pods)
+            # by the multiplicative opportunity score Σ g·(1−cur/lim). If the just-picked
+            # pod wins → piggyback (no fetch). Fetch is disabled (V13_ALLOW_FETCH=False), so
+            # idle winners are left for the next pick; the stockout override (robot travel)
+            # catches true zero-stock SKUs.
+            if ORS_VERSION == 12:
+                picked_skus = {sku for _, sku, _ in job.orders}
+                return self._dispatch_piggyback_ranked_v12(picked_pod=pod,
+                                                           picking_robot=robot,
+                                                           picked_skus=picked_skus)
+            # v13 = v12 event-driven piggyback+fetch, but ranks pods with the
+            # weighted-sum score (W_G·urgency + W_E·emptiness) instead of v12's
+            # multiplicative Σ g·(1−cur/lim).
+            if ORS_VERSION == 13:
+                picked_skus = {sku for _, sku, _ in job.orders}
+                return self._dispatch_piggyback_ranked_v13(picked_pod=pod,
+                                                           picking_robot=robot,
+                                                           picked_skus=picked_skus)
+            # v7 = PIGGYBACK + opportunity score. The just-picked pod is already in the
+            # robot's hands at the station, so if it carries SKUs that are critical AND
+            # awaited by orders, sending it straight to replenishment costs NO fetch trip
+            # (the robot continues instead of returning empty). The decision is taken
+            # HERE, at finish-picking — the pod is already free, so nothing is held back
+            # (this avoids the "pod tied up" failure of the old v7, which reserved pods
+            # mid-pick). Pods NOT passing through picking are handled by the event-driven
+            # fetch scan (_dispatch_replenishment_event) in the main loop.
             picked_skus = {sku for _, sku, _ in job.orders}
             return self._dispatch_proactive_replenishment(extra_pod=pod, picked_skus=picked_skus)
 
@@ -420,19 +591,57 @@ class Inventory(Universe):
         if len(flagged) == 0:
             return False
         # Layer 2 — Q_p = Σ U_ip(flagged) / |n_p| >= KL
-        # cap=4: per-pod SKU-count denominator capped at 4 (lowered from 6) so Q_p
-        # is not over-diluted; a smaller denominator raises Q_p, letting the AND
-        # baseline fire on its own logic instead of stalling.
-        if pod.check_pod_index(flagged, BASELINE_KL, cap=4):
+        # cap=8: per-pod SKU-count denominator capped at 8 (Chou et al. original).
+        if pod.check_pod_index(flagged, BASELINE_KL, cap=8):
             pod.last_trigger = 'global'
+            # Refill ONLY the flagged (critical) SKUs — same critical-only rule as the
+            # opportunity-score policies (v12/v13), so the comparison is fair. flagged =
+            # the SKUs below the UL threshold that triggered this pod. reserved_fill drives
+            # the critical-only refill in finish_replenishment_task.
+            pod.reserved_fill = {sku: 0.0 for sku in flagged if sku in pod.skus}
             return True
         return False
-    
+
     def finish_replenishment_task(self, job: RobotJob):
         # pod: Pod = self.pod_manager.get_pod_by_coordinate(job.pod_coordinate.x, job.pod_coordinate.y)
         pod: Pod = self.pod_manager.get_pod_by_id(job.pod.pod_id)
         qty_before = {sku: d['current_qty'] for sku, d in pod.skus.items()}
-        pod.replenish_all_skus()
+        # Refill ONLY the CRITICAL SKUs that triggered this trip (the reserved set),
+        # each up to V12_FILL_RATE × limit_qty — NOT the whole pod. Filling the whole
+        # pod 'free-rides' non-critical SKUs (they get restocked without ever being
+        # critical), which (a) cross-contaminates each SKU's replenishment pattern and
+        # (b) maximises pod mass → travel energy. Filling only the triggering SKUs at a
+        # chosen fill rate keeps replenishment per-SKU clean and controls pod mass
+        # (fill rate = prof's energy lever). Falls back to whole-pod only if no reserved
+        # set is recorded (safety).
+        reserved = getattr(pod, 'reserved_fill', None)
+        stockout_fill = getattr(pod, 'stockout_fill_skus', None)
+        # REFILL SCOPE is tied to the POLICY, so v12 and v13 differ not only in their
+        # scoring formula but in what a trip actually fills:
+        #   • v13 (and any policy with V12_FILL_WHOLE_POD) = WHOLE-POD fill: top up EVERY
+        #     SKU up to the fill rate (free-ride), matching v13's whole-pod emptiness
+        #     score → score and refill are consistent (both whole-pod).
+        #   • v12 = CRITICAL-ONLY fill: refill ONLY the critical SKUs that scored the trip
+        #     (reserved_fill = the covered critical set), matching v12's critical-only
+        #     score Σ g_i·(1−cur/lim) → score and refill are consistent (both critical).
+        #     No free-ride of non-critical SKUs; cleaner per-SKU pattern, lower pod mass.
+        whole_pod_fill = V12_FILL_WHOLE_POD and ORS_VERSION != 12
+        if whole_pod_fill:
+            # WHOLE-POD FILL: pod is at the station, so top up EVERY SKU (free-ride) up to
+            # the fill rate, regardless of which SKUs triggered the trip. Raises pile-on
+            # and keeps the pod full longer (fewer re-triggers). Kuo's proposed behaviour.
+            pod.replenish_skus_fillrate(list(pod.skus.keys()), fill_rate=V12_FILL_RATE)
+            pod.stockout_fill_skus = set()
+        elif stockout_fill:
+            # Stockout-triggered robot trip (baseline _dispatch_stockout_pods): refill ONLY
+            # the stocked-out (critical) SKU(s) that triggered this trip, at the same fill
+            # rate — NOT the whole pod. Keeps trip mass/energy comparable to proactive trips.
+            pod.replenish_skus_fillrate(list(stockout_fill), fill_rate=V12_FILL_RATE)
+            pod.stockout_fill_skus = set()             # clear marker (consumed)
+        elif reserved:
+            pod.replenish_skus_fillrate(list(reserved.keys()), fill_rate=V12_FILL_RATE)
+        else:
+            pod.replenish_all_skus()                   # safety fallback (no reserved set)
         skus_filled_this_trip = 0
         for sku, d in pod.skus.items():
             qty_added = d['current_qty'] - qty_before.get(sku, 0)
@@ -442,13 +651,24 @@ class Inventory(Universe):
         self.skus_replenished_count += skus_filled_this_trip
         # Release the reservation this pod held: its refill is now reflected in
         # the real current_global (restore_sku_data above), so the in-flight
-        # promise is no longer needed. Release exactly what was reserved.
-        reserved = getattr(pod, 'reserved_fill', None)
+        # promise is no longer needed. Release exactly what was reserved. (`reserved`
+        # already read above for the critical-SKU refill.)
+        # Log which SKUs (and their class) TRIGGERED this replenishment — the
+        # reserved set = the critical SKUs this pod was dispatched to cover. This
+        # tells us, per trip, which class actually drives replenishment.
+        if reserved:
+            with open('replenish_trigger_log.csv', 'a') as _f:
+                for sku in reserved:
+                    d = self.pod_manager.skus_data.get(sku, {})
+                    cls = d.get('item_class', '?')
+                    _f.write(f"{int(self._tick)},{pod.pod_id},{sku},{cls},"
+                             f"{pod.last_trigger}\n")
         if reserved:
             for sku, fill in reserved.items():
                 self.reserved_global[sku] = max(0.0, self.reserved_global.get(sku, 0.0) - fill)
             pod.reserved_fill = {}
-        pod_info_df = pd.read_csv('pod_info.csv')
+        # APPEND-ONLY (mode='a', no header) — never read+concat+overwrite the whole
+        # file, so a concurrent picking write cannot drop this replenishment row.
         new_row = {
                 "pod_id": pod.pod_id,
                 "item_id": -1,
@@ -459,15 +679,56 @@ class Inventory(Universe):
                 "trigger": pod.last_trigger,
                 "opp_score": pod.last_opp_score
             }
-            
-        new_row_df = pd.DataFrame([new_row])
-        pod_info_df = pd.concat([pod_info_df, new_row_df], ignore_index=True)
-        pod_info_df.to_csv('pod_info.csv', index= False)
+        pd.DataFrame([new_row], columns=["pod_id", "item_id", "qty", "order_id",
+            "processed_time", "task_type", "trigger", "opp_score"]).to_csv(
+            'pod_info.csv', mode='a', header=False, index=False)
         # job.is_finished = True
         job.set_job_finish()
         station = self.station_manager.get_station_by_id(job.station_id)
         station.remove_pod(pod.pod_id)
         return False
+
+    def _dispatch_stockout_instant(self):
+        """INSTANT stockout safety net: for each truly stocked-out SKU (current_global==0),
+        refill ONLY that stocked-out SKU in its pod immediately so the waiting orders can
+        proceed. This prevents deadlock in the event-driven system (a stocked-out SKU's pod
+        would otherwise never be dispatched, since its orders cannot complete). The refill is
+        EMERGENCY fulfilment OUTSIDE the regular robot replenishment operation, following
+        Aerts et al. (2022) and Zhang & Chen (2022) who model stockout/emergency as a SEPARATE
+        metric, not a replenishment trip. Therefore it does NOT write a replenishment-trip row,
+        does NOT add to skus_replenished, and does NOT consume robot/energy — it is recorded
+        only via the emergency-net counter (reported alongside the stockout count). This keeps
+        the replenishment-trip and energy metrics reflecting the replenishment policy alone."""
+        # Group by pod so one pod refilling several stocked-out SKUs is one emergency event.
+        skus_to_remove = set()
+        pod_fills = {}  # pod_id -> (pod_obj, [sku_id, ...])
+        for sku_id in list(self._stockout_skus):
+            pods_for_sku = self.pod_manager.sku_to_pods.get(sku_id) or []
+            chosen = None
+            for pod in pods_for_sku:
+                if pod is None or sku_id not in pod.skus:
+                    continue
+                d = pod.skus[sku_id]
+                if d['current_qty'] >= d['limit_qty']:
+                    continue
+                chosen = pod
+                break
+            skus_to_remove.add(sku_id)            # handled or unfillable — drop from set
+            if chosen is not None:
+                pod_fills.setdefault(chosen.pod_id, (chosen, []))[1].append(sku_id)
+
+        # Emergency refill: ONLY the stocked-out SKU(s) so waiting orders proceed. NOT a trip.
+        for pid, (pod, sku_ids) in pod_fills.items():
+            for sku_id in sku_ids:
+                d = pod.skus[sku_id]
+                added = d['limit_qty'] - d['current_qty']
+                if added <= 0:
+                    continue
+                d['current_qty'] = d['limit_qty']             # refill stocked-out SKU only
+                self.pod_manager.restore_sku_data(sku_id, added)
+            pod.mass = sum(x['weight'] * x['current_qty'] for x in pod.skus.values())
+            self._v13_net_fetches += 1            # emergency event counter (NOT a trip)
+        self._stockout_skus -= skus_to_remove
 
     def _compute_pending_demand(self) -> dict:
         """
@@ -525,72 +786,860 @@ class Inventory(Universe):
                 new_job = RobotJob(pod.coordinate, station_id=station_replenish.station_id, pod=pod)
                 new_job.add_replenishment_task(pod)
                 pod.last_trigger = 'stockout'
+                # Stockout override fills ONLY the stocked-out SKU on arrival (not
+                # the whole pod): a reactive trip should not "freebie top-up" the
+                # rest of the pod, which would understate the baseline's true trip
+                # count. The triggering SKU is recorded so finish_replenishment_task
+                # refills just that SKU. (Proactive ROP/opportunity trips still
+                # top-up the whole pod — see finish_replenishment_task.)
+                pod.stockout_fill_skus = set(getattr(pod, 'stockout_fill_skus', set()))
+                pod.stockout_fill_skus.add(sku_id)
                 nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
                 self.pod_manager.mark_pod_not_available(pod)
                 skus_to_remove.add(sku_id)  # 1 pod dispatched, done for this SKU
                 break
         self._stockout_skus -= skus_to_remove
 
-    def _compute_pod_score(self, pod, critical_skus) -> tuple:
-        """Compute the gate and ranking quantities for a candidate pod.
-
-          pod_gap      = 1 - Σ current_qty / Σ limit_qty   (∈[0,1])
-                         How empty the pod is relative to full capacity. Used by the
-                         GATE: a near-full pod is not worth a trip. LIMIT basis because
-                         a replenished pod is refilled to its limit (replenish_all_skus).
-          total_space  = Σ_{ALL sku in pod} max(0, limit_qty - current_qty)
-                         Refill-to-full capacity, i.e. how many units this trip would
-                         actually restock. Used for RANKING: the pod that can be topped
-                         up the most lasts longest before needing another trip, which
-                         keeps replenishment trips down.
-          urgency_max  = max over CRITICAL skus of (rop_global - current_global)/rop_global
-                         GLOBAL urgency — anticipates a warehouse-level stockout. It
-                         adaptively relaxes the gate (high urgency -> lower threshold).
-
-        The ROP trigger already decides *which* SKUs are critical; the gate and ranking
-        here both work on the LIMIT (capacity) basis, since the pod is refilled to full.
-
-        Returns (pod_gap, total_space, urgency_max).
-        """
-        total_current = 0.0
-        total_limit = 0.0
-        total_space = 0.0
-        for s in pod.skus.values():
-            cur = float(s.get('current_qty', 0))
-            limit = float(s.get('limit_qty', 0))
-            if limit <= 0:
-                continue
-            total_current += cur
-            total_limit += limit
-            total_space += max(0.0, limit - cur)
-
-        pod_gap = (1.0 - total_current / total_limit) if total_limit > 0 else 0.0
-
-        urgency_max = 0.0
-        for s_id in pod.skus:
-            if s_id not in critical_skus:
-                continue
-            data = self.pod_manager.skus_data.get(s_id, {})
-            rop = data.get('rop_global', 0)
-            if rop <= 0:
-                continue
-            current_global = data.get('current_global_qty', 0)
-            urgency = max(0.0, min(1.0, (rop - current_global) / rop))
-            if urgency > urgency_max:
-                urgency_max = urgency
-        return pod_gap, total_space, urgency_max
-
     def _dispatch_proactive_replenishment(self, extra_pod=None, picked_skus=None):
-        """Post-pick ORS dispatcher — routes by ORS_VERSION (2=direct,
-        6=two-level ROP pod-local)."""
+        """Post-pick ORS dispatcher — routes by ORS_VERSION (6=two-level ROP pod-local,
+        7=+in-flight reservation; v6 is the default).
+        v8/v9 are NOT routed here — they are purely proactive (loop-tick) and
+        finish_picking_task returns before reaching this dispatcher."""
         if ORS_VERSION == 7:
             return self._dispatch_proactive_replenishment_v7(extra_pod=extra_pod,
                                                              picked_skus=picked_skus)
-        if ORS_VERSION == 6:
-            return self._dispatch_proactive_replenishment_v6(extra_pod=extra_pod,
-                                                             picked_skus=picked_skus)
-        return self._dispatch_proactive_replenishment_v2(extra_pod=extra_pod,
+        return self._dispatch_proactive_replenishment_v6(extra_pod=extra_pod,
                                                          picked_skus=picked_skus)
+
+    def _pod_critical_coverage(self, pod, critical_set, pending):
+        """Critical SKUs this pod can actually restock now: globally critical
+        (s ∈ critical_set), this pod's slot also low (slot_stock ≤ rop_per_slot),
+        and room to refill (current < limit). Returns {sku: (urgency, room)} where
+        urgency = committed pending demand (fallback mean_daily_demand), room = fill."""
+        cov = {}
+        for s_id in critical_set:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            cur = float(s.get('current_qty', 0))
+            limit = float(s.get('limit_qty', 0))
+            if cur >= limit:
+                continue                       # slot full — cannot help this SKU
+            if not Pod.is_slot_low(s):
+                continue                       # per-slot ROP filter: no slot low
+            committed = float(pending.get(s_id, 0))
+            urgency = committed if committed > 0 else float(
+                self.pod_manager.skus_data.get(s_id, {}).get('mean_daily_demand', 0.0))
+            cov[s_id] = (urgency, limit - cur)
+        return cov
+
+    def _reserve_pod_fill(self, pod, covered_skus):
+        """Reserve the in-flight refill for the covered SKUs (v7-style), so other
+        pods' triggers for these SKUs are suppressed while this pod is en route."""
+        pod.reserved_fill = {}
+        for s_id in covered_skus:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            fill = float(s.get('limit_qty', 0)) - float(s.get('current_qty', 0))
+            if fill > 0:
+                self.reserved_global[s_id] += fill
+                pod.reserved_fill[s_id] = fill
+
+    def _build_critical_set(self):
+        """Globally-critical SKU set: warehouse stock at/under ROP (ROP-global trigger),
+        net of in-flight reservations so a SKU an en-route pod already covers drops out."""
+        critical = set()
+        for s_id, d in self.pod_manager.skus_data.items():
+            eff = d.get('current_global_qty', 1) + self.reserved_global.get(s_id, 0.0)
+            if eff <= d.get('rop_global', 0):
+                critical.add(s_id)
+        return critical
+
+    def _v9_pod_score(self, pod, critical_set, pending):
+        """v9 opportunity score of a pod: Σ pending(s)·urgency(s) over SKUs that are
+        critical globally (s ∈ critical_set) AND low in THIS pod's slot
+        (slot_stock ≤ rop_per_slot). urgency = 1 − slot_stock/rop_per_slot ∈ [0,1]
+        measures how close the slot is to empty (proportional, so it is fair between
+        large-box and small-box SKUs). pending = committed waiting-order units for the
+        SKU (relevance to throughput); SKUs with no waiting demand (pending = 0)
+        contribute nothing, so a trip is only worthwhile if it serves real orders.
+        Returns (score, covered_skus)."""
+        score = 0.0
+        covered = []
+        for s_id in critical_set:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            cur = float(s.get('current_qty', 0))
+            rps = float(s.get('rop_per_slot', 0))
+            if not Pod.is_slot_low(s):
+                continue                       # this pod's slot is not low for s
+            if cur >= float(s.get('limit_qty', 0)):
+                continue                       # slot already full — refill adds nothing
+            pend = float(pending.get(s_id, 0))
+            if pend <= 0:
+                continue                       # no waiting order needs s right now
+            urgency = max(0.0, 1.0 - Pod.slot_stock(s) / rps) if rps > 0 else 0.0
+            score += pend * urgency
+            covered.append(s_id)
+        return score, covered
+
+    def _v10_pod_score(self, pod, critical_set, pending):
+        """v10 opportunity score (scan-based, periodic global review).
+
+            Score(p) = Σ  g_i · (1 − cur_i/lim_i) · pending_i
+                     i ∈ critical_set ∩ p,  cur_i < lim_i,  pending_i > 0
+
+        where, for SKU i:
+          g_i = (rop_global_i − current_global_i) / rop_global_i, clipped [0,1]
+              — warehouse urgency: how deep below ROP the SKU is (per-SKU ranking,
+                SKUs closer to stockout weigh more), straight from current_global;
+          (1 − cur_i/lim_i) — slot fill-rate deficit in THIS pod, normalized so it
+              is fair across item box sizes (no unit/box-size bias);
+          pending_i — committed units awaited by active orders (demand-awareness):
+              SKUs with no waiting order contribute 0, so trips are spent only on
+              SKUs orders actually need now — this is what keeps trips low
+              (a pure stock-based score over-replenishes SKUs not yet demanded).
+        Σ means a pod serving more (urgent, depleted, demanded) critical SKUs ranks
+        higher — joint replenishment fills the whole pod, so more useful SKUs per
+        trip is worth more.
+
+        Trigger is ROP-global only (membership in critical_set); slot emptiness and
+        demand enter as WEIGHTS, not gates (no rop_per_slot / is_slot_low — tested
+        and it did not reduce trips). This is v9's demand-awareness PLUS the global
+        urgency weight g_i.
+        Returns (score, covered_skus)."""
+        skus_data = self.pod_manager.skus_data
+        score = 0.0
+        covered = []
+        for s_id in critical_set:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            cur = float(s.get('current_qty', 0))
+            lim = float(s.get('limit_qty', 0))
+            if lim <= 0 or cur >= lim:
+                continue                       # slot full — refill adds nothing
+            pend = float(pending.get(s_id, 0))
+            if pend <= 0:
+                continue                       # no waiting order needs this SKU now
+            d = skus_data.get(s_id, {})
+            rg = float(d.get('rop_global', 0))
+            cg = float(d.get('current_global_qty', 0))
+            g = max(0.0, min(1.0, (rg - cg) / rg)) if rg > 0 else 0.0
+            score += g * (1.0 - cur / lim) * pend
+            covered.append(s_id)
+        return score, covered
+
+    def _v11_pod_score(self, pod, critical_set):
+        """v11 opportunity score WITHOUT pending (ablation): Σ g_i·(1−cur/lim) over
+        critical SKUs in the pod with cur < lim. Pure stock-based (no demand-awareness)
+        — replenishes any critical, depleted SKU regardless of waiting orders.
+        Returns (score, covered_skus)."""
+        skus_data = self.pod_manager.skus_data
+        score = 0.0
+        covered = []
+        for s_id in critical_set:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            cur = float(s.get('current_qty', 0))
+            lim = float(s.get('limit_qty', 0))
+            if lim <= 0 or cur >= lim:
+                continue                       # slot full — refill adds nothing
+            d = skus_data.get(s_id, {})
+            rg = float(d.get('rop_global', 0))
+            cg = float(d.get('current_global_qty', 0))
+            # Urgency g_i = how deep the warehouse stock is BELOW the reorder point:
+            # (rop − current_global) / rop, clipped [0,1]. All scored SKUs are already ≤ ROP
+            # (critical-set gate), so g_i = how far past the danger line (0 at ROP, 1 at zero
+            # stock). ROP is per-SKU (demand×lead-time) → fair across SKU sizes, unlike cur/max.
+            g = max(0.0, min(1.0, (rg - cg) / rg)) if rg > 0 else 0.0
+            score += g * (1.0 - cur / lim)
+            covered.append(s_id)
+        return score, covered
+
+    def _v13_pod_score(self, pod, critical_set):
+        """v13 opportunity score — WEIGHTED SUM of two components (analogous to the
+        J = w_o·√OVR + w_i·√IVR cost function of Priore et al., 2019, which balances
+        two objectives via weights). Both components are scaled 0–1.
+
+            Score_p = W_G · g_pod + W_E · emptiness_pod
+
+          g_pod (global urgency / anti-stockout) = MAX over the pod's CRITICAL SKUs of
+                g_i = max(0, (rop_global_i − current_global_i) / rop_global_i)
+              — how close the most-critical SKU is to a WAREHOUSE-level stockout
+              (relative to its reorder point). Pulls the pod UP when a SKU is near a
+              global stockout. Range 0–1. SERVICE component (OVR-analog): evaluated over
+              critical SKUs because those are the ones at stockout risk.
+
+          emptiness_pod (whole-pod slot depletion) = 1 − (Σ current_qty / Σ limit_qty)
+              over ALL SKUs in the pod — how empty THIS pod is overall, i.e. how much
+              room a replenishment trip would actually refill. Evaluated over the WHOLE
+              pod (not just critical SKUs) because a replenishment trip refills the
+              ENTIRE pod (replenish_all_skus), so trip efficiency depends on the pod's
+              TOTAL deficit, not just its critical slots. Range 0–1. TRIP-EFFICIENCY
+              component (IVR-analog).
+
+        The two look at DIFFERENT levels — g at the warehouse, emptiness at this pod's
+        total fill — so they are complementary, not duplicates:
+          W_G high → prefer the pod whose SKU is most globally critical (service).
+          W_E high → prefer the pod that is most empty overall (most room to refill →
+                     fuller, more efficient trips → fewer total trips).
+        Varying (W_G, W_E) shifts the winning pod, tracing a Pareto frontier.
+
+        The pod is scored only if it covers ≥1 critical SKU with room to refill.
+        Returns (score, covered_critical_skus)."""
+        skus_data = self.pod_manager.skus_data
+        covered = []
+        # --- g component: COMBINED stockout risk over CRITICAL SKUs (service) ---
+        # g = 1 − ∏(1 − g_i) over the pod's critical SKUs, where g_i is each SKU's urgency
+        # (rop−cg)/rop clipped to [0,1] (per-SKU formula UNCHANGED). Unlike a MAX — which only
+        # sees the single most-critical SKU and is blind to how many critical SKUs a pod
+        # carries — the product form is coverage-aware: a pod carrying MORE (or more urgent)
+        # critical SKUs scores higher, so replenishing it relieves more impending stockouts in
+        # one trip. It stays in [0,1] (same scale as emptiness, so the W_G/W_E weights remain
+        # interpretable), while still rising with the number of critical SKUs. Reads as the
+        # pod's combined stockout risk.
+        prod_safe = 1.0                        # ∏(1 − g_i)
+        for s_id in critical_set:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            cur = float(s.get('current_qty', 0))
+            lim = float(s.get('limit_qty', 0))
+            if lim <= 0 or cur >= lim:
+                continue                       # slot full — refill adds nothing
+            d = skus_data.get(s_id, {})
+            rg = float(d.get('rop_global', 0))
+            cg = float(d.get('current_global_qty', 0))
+            # g_i = how deep the warehouse stock is BELOW the reorder point, relative to ROP:
+            # (rop − current_global) / rop, clipped [0,1]. All scored SKUs are already ≤ ROP
+            # (the critical-set gate), so this measures HOW FAR past the danger line each SKU
+            # is — g_i=0 at ROP, g_i=1 at zero stock. ROP is per-SKU (demand×lead-time), so it
+            # is a fair urgency yardstick across SKUs of different size, unlike cur/max which
+            # over-weights large-capacity SKUs.
+            g_i = max(0.0, min(1.0, (rg - cg) / rg)) if rg > 0 else 0.0
+            prod_safe *= (1.0 - g_i)
+            covered.append(s_id)
+        if not covered:
+            return 0.0, covered
+        g_pod = 1.0 - prod_safe                # combined stockout risk, [0,1], rises with coverage
+        # --- emptiness component: POD INVENTORY LEVEL over the WHOLE POD ---
+        # emptiness_pod = 1 − (Σ current_qty / Σ limit_qty) over ALL SKUs in the pod
+        # (critical AND non-critical) = how empty the WHOLE pod is. The trip refills the
+        # WHOLE pod (V12_FILL_WHOLE_POD), so trip efficiency depends on the pod's TOTAL
+        # deficit, not just critical slots. Measured over all SKUs, this is INDEPENDENT of
+        # g (which only looks at critical SKUs at the warehouse level) — so the W_G/W_E
+        # weights actually move the winning pod (the critical-only emptiness was ~0.95
+        # correlated with g → flat Pareto). Σcur/Σlim is quantity-weighted = the pod's
+        # real fill level.
+        tot_cur = 0.0
+        tot_lim = 0.0
+        for s in pod.skus.values():
+            lim = float(s.get('limit_qty', 0))
+            if lim <= 0:
+                continue
+            tot_cur += float(s.get('current_qty', 0))
+            tot_lim += lim
+        emptiness_pod = (1.0 - tot_cur / tot_lim) if tot_lim > 0 else 0.0
+        score = V13_W_G * g_pod + V13_W_E * emptiness_pod
+        # Stash the two components on the pod so the dispatcher can log them for the
+        # WINNING pod → lets us measure the real g–emptiness correlation (how independent
+        # service vs efficiency objectives are → whether the Pareto front will have spread
+        # or collapse to a line). Diagnostic only.
+        pod._last_g_pod = g_pod
+        pod._last_emptiness_pod = emptiness_pod
+        return score, covered
+
+    def _pod_opportunity_v8(self, pod, critical_set, pending):
+        """v8 opportunity score:
+            OpportunityScore_p = CriticalDemandCoverage_p × TotalRefillGap_p
+        where
+            CriticalDemandCoverage_p = Σ_{i critical in p} min(pending_i, refill_gap_i,p)
+                — committed order demand this pod can actually satisfy for its critical
+                  SKUs (capped by what its slots can hold, via min);
+            TotalRefillGap_p = Σ_{all SKUs j in p} (slot_capacity_j − current_qty_j)
+                — total empty space a single trip would refill (emptiest-first, whole pod).
+        Returns (score, covered_critical_skus). A SKU is 'critical' iff it passes the
+        two-level trigger (global ≤ rop_global AND per-slot ≤ rop_per_slot) and is awaited
+        by an order (pending > 0)."""
+        coverage = 0.0
+        covered = []
+        for s_id in critical_set:
+            s = pod.skus.get(s_id)
+            if s is None:
+                continue
+            cur = float(s.get('current_qty', 0))
+            limit = float(s.get('limit_qty', 0))
+            if not Pod.is_slot_low(s):
+                continue                       # per-slot ROP: this slot not low
+            gap_i = limit - cur
+            if gap_i <= 0:
+                continue                       # slot full
+            pend = float(pending.get(s_id, 0))
+            if pend <= 0:
+                continue                       # no waiting order needs it
+            coverage += min(pend, gap_i)       # demand this pod can actually fill
+            covered.append(s_id)
+        if not covered:
+            return 0.0, []
+        total_gap = 0.0                        # whole-pod empty space (all SKUs)
+        for s in pod.skus.values():
+            total_gap += max(0.0, float(s.get('limit_qty', 0)) - float(s.get('current_qty', 0)))
+        return coverage * total_gap, covered
+
+    def _v9_select_replenishment_pod(self, exclude_pods=None, use_score=True):
+        """EVENT-DRIVEN ARBITRATION: pick the single best IDLE pod to replenish now,
+        among pods carrying globally+per-pod critical SKUs needed by waiting orders.
+        Returns (pod, covered_skus) or (None, None) if nothing is worthwhile.
+        reserved_global already removes SKUs that an en-route pod will cover, so this
+        naturally stops diverting robots once each critical SKU has one pod on the way.
+
+        Both require the SAME trigger: the pod must carry ≥1 SKU that is critical at the
+        global (≤ rop_global) AND per-slot (≤ rop_per_slot) level. They differ only in how
+        eligible pods are RANKED:
+          use_score=True  (v9): Σ pending·urgency over the pod's critical SKUs.
+          use_score=False (v8): committed-demand-weighted emptiest-first — rank the pod
+            by (Σ pending over its critical SKUs) × (pod space ratio). Both factors are
+            per-pod, so they combine consistently: the first favours pods whose critical
+            SKUs are actually awaited by orders (relevance to throughput), the second
+            favours pods that a single trip can refill the most (emptiest-first
+            efficiency, Bolu; Merschformann). No urgency/ROP term in the score, so
+            rop_per_slot is used only in the trigger, not double-counted.
+        Comparing v8 vs v9 isolates whether the per-SKU urgency score helps."""
+        pending = self._compute_pending_demand()
+        critical = self._build_critical_set()
+        if not critical:
+            return None, None
+        exclude = exclude_pods or set()
+        best_pod, best_rank, best_cov = None, 0.0, None
+        for pod in self.pod_manager.pods:
+            if pod.pod_id in exclude:
+                continue
+            if not self.pod_manager.is_idle(pod.pod_id):
+                continue
+            score, cov = self._v9_pod_score(pod, critical, pending)
+            if not cov:
+                continue                       # pod carries no eligible critical SKU → not triggered
+            if use_score:
+                rank = score                                   # v9: Σ pending·urgency
+            else:
+                pending_pod = self._v9_pending_pod(pod, critical, pending)
+                rank = pending_pod * self._pod_space_ratio(pod)  # v8: pending × space ratio
+            if rank > best_rank:
+                best_pod, best_rank, best_cov = pod, rank, cov
+        if best_pod is None:
+            return None, None
+        return best_pod, best_cov
+
+    def _v9_pending_pod(self, pod, critical_set, pending):
+        """Total committed pending demand over the pod's critical SKUs (two-level:
+        globally critical AND this pod's slot ≤ rop_per_slot). Used by v8's ranking."""
+        total = 0.0
+        for s_id, s in pod.skus.items():
+            if s_id not in critical_set:
+                continue                       # lapis 1: globally critical
+            if not Pod.is_slot_low(s):
+                continue                       # lapis 2: this pod's slot is low
+            total += float(pending.get(s_id, 0))
+        return total
+
+    def _pod_space_ratio(self, pod):
+        """Emptiest-first metric: total empty space over total slot capacity across ALL
+        SKUs in the pod (a replenishment trip refills the whole pod, so the benefit is
+        the pod's overall fillable fraction). Returns a value in [0, 1]."""
+        empty = 0.0
+        cap = 0.0
+        for s in pod.skus.values():
+            limit = float(s.get('limit_qty', 0))
+            cur = float(s.get('current_qty', 0))
+            cap += limit
+            empty += max(0.0, limit - cur)
+        return (empty / cap) if cap > 0 else 0.0
+
+    def _pods_in_picking(self):
+        """Pods currently carried by a robot on an UNFINISHED PICKING job. Selecting
+        one of these costs no extra trip: it is flagged and diverted to replenishment
+        right after its pick completes (finish_picking_task)."""
+        pods = {}
+        for o in self.get_movable_objects():
+            if o.object_type != 'robot':
+                continue
+            job = getattr(o, 'job', None)
+            if job is None or job.is_finished or job.pod is None:
+                continue
+            station = self.station_manager.get_station_by_id(job.station_id)
+            if station is not None and station.is_picker_station():
+                pods[job.pod.pod_id] = job.pod
+        return pods
+
+    def _directed_opportunity_scan(self):
+        """
+        ORS v8 — DIRECTED OPPORTUNITY REPLENISHMENT (proactive, greedy set-cover).
+        Run on the order-processing cadence (loop-tick). Scans the WHOLE warehouse
+        for globally-critical SKUs and greedily picks the pods covering the most
+        critical demand per trip:
+
+            critical set  S = { s : eff_global(s) ≤ rop_global(s) }   (ROP-global trigger)
+            score(pod)    = Σ_{s∈S covered by pod}  urgency(s) × refill_room(s)
+            urgency(s)    = pending_demand(s)  (committed orders; fallback mean_daily_demand)
+
+        CANDIDATES include BOTH idle pods AND pods currently picking:
+          - idle pod selected      → robot fetches it now (one extra retrieval trip).
+          - picking pod selected    → flagged need_replenishment=True; it diverts to
+                                       replenishment right after its pick completes
+                                       (no extra trip — already in hand).
+        Selection is by score only — a picking pod wins iff it genuinely covers more
+        critical demand, in which case the trip is also free. Covered SKUs are
+        reserved (reserved_global) so the next greedy step / next scan does not
+        dispatch a second pod for them. Repeats until S is covered OR replenishment-
+        station capacity is exhausted (idle-pod dispatch also needs an idle robot).
+        """
+        pending = self._compute_pending_demand()
+        remaining = self._build_critical_set()
+        if not remaining:
+            return
+
+        picking_pods = self._pods_in_picking()  # {pod_id: pod} carried on picking jobs
+
+        while remaining:
+            station_replenish = self.station_manager.find_available_replenish_station()
+            if station_replenish is None:
+                break  # respect replenishment-station capacity
+
+            # Score every candidate pod: idle pods + pods currently picking.
+            # A picking pod already flagged for replenishment is skipped (counted once).
+            best_pod, best_score, best_cov, best_is_picking = None, 0.0, None, False
+            seen = set()
+            for pod in self.pod_manager.pods:
+                pid = pod.pod_id
+                is_picking = pid in picking_pods
+                if not is_picking and not self.pod_manager.is_idle(pid):
+                    continue                      # busy but not picking (e.g. en route) — skip
+                if is_picking and pod.need_replenishment:
+                    continue                      # already flagged this scan
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                cov = self._pod_critical_coverage(pod, remaining, pending)
+                if not cov:
+                    continue
+                score = sum(u * r for (u, r) in cov.values())
+                if score > best_score:
+                    best_pod, best_score, best_cov, best_is_picking = pod, score, cov, is_picking
+            if best_pod is None:
+                break  # no candidate covers any remaining critical SKU
+
+            self._reserve_pod_fill(best_pod, best_cov.keys())
+            best_pod.last_opp_score = best_score
+            remaining -= set(best_cov.keys())
+
+            if best_is_picking:
+                # FREE: divert to replenishment after its pick completes.
+                best_pod.need_replenishment = True
+                best_pod.last_trigger = 'directed_after_pick'
+                with open('score_log.csv', 'a') as _f:
+                    _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_score:.6f},"
+                             f"0.000000,{best_score:.6f},0.000000\n")
+                continue  # no station/robot consumed now; replenish station reserved at finish
+
+            # IDLE: fetch now — needs an idle robot.
+            nearest_robot, current_distance = None, float('inf')
+            for o in self.get_movable_objects():
+                if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                    dist = calculateDistance(o.pos_x, o.pos_y, best_pod.pos_x, best_pod.pos_y)
+                    if dist < current_distance:
+                        nearest_robot, current_distance = o, dist
+            if nearest_robot is None:
+                # release the reservation we just made (no robot to carry it)
+                for s_id, fill in (best_pod.reserved_fill or {}).items():
+                    self.reserved_global[s_id] = max(0.0, self.reserved_global.get(s_id, 0.0) - fill)
+                best_pod.reserved_fill = {}
+                break
+
+            latest = get_pod_location(best_pod.pod_id)
+            if latest:
+                best_pod.pos_x, best_pod.pos_y = int(latest[0]), int(latest[1])
+            station_replenish.add_pod(best_pod.pod_id)
+            new_job = RobotJob(best_pod.coordinate, station_id=station_replenish.station_id, pod=best_pod)
+            new_job.add_replenishment_task(best_pod)
+            best_pod.last_trigger = 'directed_opportunity'
+            nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+            self.pod_manager.mark_pod_not_available(best_pod)
+            with open('score_log.csv', 'a') as _f:
+                _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_score:.6f},"
+                         f"0.000000,{best_score:.6f},0.000000\n")
+
+    def _dispatch_replenishment_event(self, use_score=True, max_dispatch=None):
+        """EVENT-DRIVEN replenishment (WES robot life-cycle, Bolu & Korçak 2021): when
+        robots are free, send each to replenish the best pod carrying two-level-critical
+        SKUs (global ≤ rop_global AND per-slot ≤ rop_per_slot) needed by waiting orders.
+        Ranking: v9 = Σ pending·urgency; v8/v7 = CriticalDemandCoverage × TotalRefillGap.
+        max_dispatch caps how many pods are sent THIS tick:
+          None (v8/v9) = greedy, dispatch all worthwhile pods (bounded by free robots /
+                         station capacity);
+          1    (v7)     = at most one pod per tick, so replenishment never takes more than
+                         one robot from picking per step (more conservative).
+        Reservation prevents two pods per SKU; stops when no free robot / no free
+        station / no worthwhile pod, so picking isn't starved."""
+        pending = self._compute_pending_demand()
+        critical = self._build_critical_set()
+        if not critical:
+            return
+        dispatched = 0
+        while True:
+            if max_dispatch is not None and dispatched >= max_dispatch:
+                break  # cap reached (v7: 1 pod/tick)
+            station_replenish = self.station_manager.find_available_replenish_station()
+            if station_replenish is None:
+                break  # respect replenishment-station capacity
+
+            # best idle pod carrying still-critical SKUs (re-evaluated each iteration)
+            #   v9 = Σ pending·urgency (_v9_pod_score)
+            #   v8 = CriticalDemandCoverage × TotalRefillGap (_pod_opportunity_v8)
+            best_pod, best_rank, best_cov = None, 0.0, None
+            for pod in self.pod_manager.pods:
+                if not self.pod_manager.is_idle(pod.pod_id):
+                    continue
+                if ORS_VERSION == 10:
+                    rank, cov = self._v10_pod_score(pod, critical, pending)
+                elif use_score:
+                    rank, cov = self._v9_pod_score(pod, critical, pending)
+                else:
+                    rank, cov = self._pod_opportunity_v8(pod, critical, pending)
+                if not cov:
+                    continue
+                if rank > best_rank:
+                    best_pod, best_rank, best_cov = pod, rank, cov
+            if best_pod is None:
+                break  # nothing worthwhile to replenish
+
+            # nearest idle robot to carry it
+            nearest_robot, current_distance = None, float('inf')
+            for o in self.get_movable_objects():
+                if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                    dist = calculateDistance(o.pos_x, o.pos_y, best_pod.pos_x, best_pod.pos_y)
+                    if dist < current_distance:
+                        nearest_robot, current_distance = o, dist
+            if nearest_robot is None:
+                break  # no free robot — picking keeps the rest; retried next tick
+
+            self._reserve_pod_fill(best_pod, best_cov)  # no second pod for these SKUs
+            critical -= set(best_cov)                   # drop covered SKUs for the rest of this pass
+            latest = get_pod_location(best_pod.pod_id)
+            if latest:
+                best_pod.pos_x, best_pod.pos_y = int(latest[0]), int(latest[1])
+            station_replenish.add_pod(best_pod.pod_id)
+            new_job = RobotJob(best_pod.coordinate, station_id=station_replenish.station_id, pod=best_pod)
+            new_job.add_replenishment_task(best_pod)
+            best_pod.last_trigger = ('event_score' if use_score
+                                     else ('event_cap1' if max_dispatch == 1 else 'event_cov'))
+            best_pod.last_opp_score = sum(float(pending.get(s, 0)) for s in best_cov)
+            nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+            self.pod_manager.mark_pod_not_available(best_pod)
+            dispatched += 1
+            with open('score_log.csv', 'a') as _f:
+                _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_pod.last_opp_score:.6f},"
+                         f"0.000000,{best_pod.last_opp_score:.6f},0.000000\n")
+
+    def _dispatch_piggyback_ranked_v11(self, picked_pod=None, picking_robot=None, picked_skus=None):
+        """ORS v11 — EVENT-DRIVEN (at finish-picking only), one COMBINED ranking, max 1 pod.
+
+        TRIGGER: evaluation runs only if a JUST-PICKED SKU has crossed its global reorder
+        point (current_global ≤ rop_global) — picking is what lowered the warehouse stock,
+        so this is the reorder-point trigger fired by the demand event that caused it.
+        Pickings that leave all their SKUs above ROP trigger nothing.
+
+        SCOPE: once triggered, the FULL critical set is considered (all globally critical
+        SKUs, not just the picked ones), so an urgent SKU in a pod that did not pass
+        through picking is not missed. Score the just-picked pod TOGETHER with all idle
+        (non-queued) pods carrying critical SKUs (Σ g_i·(1−cur/lim), NO pending), then
+        dispatch AT MOST ONE pod — the single top scorer:
+
+          - if the just-picked pod is the top scorer → PIGGYBACK (return True so the main
+            loop sends it straight to replenishment for free; no fetch trip);
+          - if an idle pod is the top scorer → FETCH it once with the nearest idle robot;
+          - if nothing scores > 0 → pod returns to storage.
+
+        Remaining critical SKUs wait for the next picking event (~every 6 ticks). Returns
+        True iff the just-picked pod is piggybacked. Pure score (no free bonus).
+        """
+        if picked_pod is None:
+            return False
+        critical = self._build_critical_set()
+        if not critical:
+            return False
+        # TRIGGER: only proceed if a just-picked SKU is itself globally critical.
+        picked_critical = (set(picked_skus) & critical) if picked_skus else set()
+        if not picked_critical:
+            return False
+
+        queued_pod_ids = {j.pod.pod_id for j in self.job_queue if j.pod is not None}
+
+        # ONE combined ranking, dispatch AT MOST ONE pod (no greedy loop). Remaining
+        # critical SKUs wait for the next picking event.
+        candidates = [picked_pod] + [
+            p for p in self.pod_manager.pods
+            if p.pod_id != picked_pod.pod_id
+            and self.pod_manager.is_idle(p.pod_id)
+            and p.pod_id not in queued_pod_ids
+        ]
+        best_pod, best_rank, best_cov = None, 0.0, None
+        for pod in candidates:
+            rank, cov = self._v11_pod_score(pod, critical)  # no pending
+            if not cov:
+                continue
+            if rank > best_rank:
+                best_pod, best_rank, best_cov = pod, rank, cov
+        if best_pod is None or best_rank <= 0.0:
+            return False                         # nothing worthwhile → pod to storage
+
+        # Winner is the just-picked pod → PIGGYBACK (main loop sends it straight on).
+        if best_pod.pod_id == picked_pod.pod_id:
+            self._reserve_pod_fill(picked_pod, best_cov)
+            picked_pod.last_trigger = 'v11_piggyback'
+            picked_pod.last_opp_score = best_rank
+            with open('score_log.csv', 'a') as _f:
+                _f.write(f"{int(self._tick)},{picked_pod.pod_id},{best_rank:.6f},"
+                         f"0.000000,{best_rank:.6f},0.000000\n")
+            return True
+
+        # Winner is an idle pod → FETCH it once (needs a station + a free robot).
+        station_replenish = self.station_manager.find_available_replenish_station()
+        if station_replenish is None:
+            return False
+        nearest_robot, current_distance = None, float('inf')
+        for o in self.get_movable_objects():
+            if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                dist = calculateDistance(o.pos_x, o.pos_y, best_pod.pos_x, best_pod.pos_y)
+                if dist < current_distance:
+                    nearest_robot, current_distance = o, dist
+        if nearest_robot is None:
+            return False
+        self._reserve_pod_fill(best_pod, best_cov)
+        latest = get_pod_location(best_pod.pod_id)
+        if latest:
+            best_pod.pos_x, best_pod.pos_y = int(latest[0]), int(latest[1])
+        station_replenish.add_pod(best_pod.pod_id)
+        new_job = RobotJob(best_pod.coordinate, station_id=station_replenish.station_id, pod=best_pod)
+        new_job.add_replenishment_task(best_pod)
+        best_pod.last_trigger = 'v11_fetch'
+        best_pod.last_opp_score = best_rank
+        nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+        self.pod_manager.mark_pod_not_available(best_pod)
+        with open('score_log.csv', 'a') as _f:
+            _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_rank:.6f},"
+                     f"0.000000,{best_rank:.6f},0.000000\n")
+        return False                             # just-picked pod returns to storage
+
+    def _dispatch_piggyback_ranked_v12(self, picked_pod=None, picking_robot=None, picked_skus=None):
+        """ORS v12 — EVENT-DRIVEN, ONE pod per picking event (no per-tick scan, no greedy).
+
+        Like v11 (evaluated ONLY at finish-picking, opportunity score Σ g_i·(1−cur/lim),
+        NO pending), but dispatches AT MOST ONE pod per picking event — the single
+        highest-scoring candidate. Remaining critical SKUs wait for the NEXT picking event
+        (which comes ~every 6 ticks, so the backlog clears quickly). This keeps the
+        mechanism simple ("one replenishment decision per picking") and spreads robot load
+        (at most one robot taken from picking per event).
+
+        At finish-picking: rank the just-picked pod TOGETHER with all idle (non-queued)
+        pods carrying critical SKUs. Take the single top scorer:
+          - if it is the just-picked pod → PIGGYBACK (return True; robot continues straight
+            to replenishment, no fetch trip);
+          - if it is an idle pod → FETCH it once with the nearest idle robot; the
+            just-picked pod returns to storage (return False);
+          - if nothing scores > 0 → pod returns to storage (return False).
+        Pure score (no free bonus for the just-picked pod). Reservation prevents a later
+        event from dispatching a second pod for the same SKU.
+        Returns True iff the just-picked pod is piggybacked.
+        """
+        if picked_pod is None:
+            return False
+        critical = self._build_critical_set()
+        if not critical:
+            return False
+
+        # GATE (piggyback trigger): the just-picked pod must hold AT LEAST ONE globally
+        # critical SKU (current_global <= rop_global) for this picking event to trigger a
+        # replenishment decision. We check every SKU the pod carries (picked_pod.skus), not
+        # only the SKUs taken in this job — the pod is in the robot's hands now, so if it
+        # holds any critical SKU it is worth evaluating. Without the gate, every
+        # finish-picking re-evaluated the whole warehouse (dispatch tracked the constant
+        # picking rate, not the ROP); with it, evaluation fires only when the picked pod is
+        # itself critical, tying the trigger to ROP (higher ROP → pods go critical sooner →
+        # more triggers).
+        if not any(s in critical for s in picked_pod.skus):
+            return False
+
+        # Candidate set: the just-picked pod PLUS all idle, non-queued pods carrying ANY
+        # globally critical SKU. The gate above already established this picking event is
+        # worth a replenishment decision (the just-picked pod holds a critical SKU); from
+        # here "look at other pods" means comparing the opportunity score of EVERY pod that
+        # carries a critical SKU — not only pods that share the picked pod's SKU — and
+        # dispatching the single highest-scoring one (the professor's brief).
+        queued_pod_ids = {j.pod.pod_id for j in self.job_queue if j.pod is not None}
+        candidates = [picked_pod] + [
+            p for p in self.pod_manager.pods
+            if p.pod_id != picked_pod.pod_id
+            and self.pod_manager.is_idle(p.pod_id)
+            and p.pod_id not in queued_pod_ids
+        ]
+        best_pod, best_rank, best_cov = None, 0.0, None
+        for pod in candidates:
+            rank, cov = self._v11_pod_score(pod, critical)   # no pending
+            if not cov:
+                continue
+            if rank > best_rank:
+                best_pod, best_rank, best_cov = pod, rank, cov
+
+        if best_pod is None or best_rank <= 0.0:
+            return False                         # nothing worthwhile → pod to storage
+
+        # Winner is the just-picked pod → PIGGYBACK (main loop sends it straight on).
+        if best_pod.pod_id == picked_pod.pod_id:
+            self._reserve_pod_fill(picked_pod, best_cov)
+            picked_pod.last_trigger = 'v12_piggyback'
+            picked_pod.last_opp_score = best_rank
+            with open('score_log.csv', 'a') as _f:
+                _f.write(f"{int(self._tick)},{picked_pod.pod_id},{best_rank:.6f},"
+                         f"0.000000,{best_rank:.6f},0.000000\n")
+            return True
+
+        # Winner is an idle pod.
+        # If fetch is disabled (V13_ALLOW_FETCH False), do NOT dispatch it — leave it to
+        # be served the next time it passes through picking. The just-picked pod returns
+        # to storage. This makes every v12 replenishment a PIGGYBACK (zero fetch trips),
+        # matching the v13 fetch-off behaviour. The stockout-net (instant, untracked as a
+        # trip) catches any SKU that truly hits zero before its pod passes picking.
+        if not V13_ALLOW_FETCH:
+            return False
+        # FETCH the winning idle pod once. Need a replenishment-station slot AND a robot;
+        # if either is missing, DO NOT queue — drop this fetch (return False), the same as
+        # the v13 path. (Matches v13 fetch logic so v12/v13 are apple-to-apple.)
+        station_replenish = self.station_manager.find_available_replenish_station()
+        if station_replenish is None:
+            return False
+        nearest_robot, current_distance = None, float('inf')
+        for o in self.get_movable_objects():
+            if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                dist = calculateDistance(o.pos_x, o.pos_y, best_pod.pos_x, best_pod.pos_y)
+                if dist < current_distance:
+                    nearest_robot, current_distance = o, dist
+        if nearest_robot is None:
+            return False
+        self._reserve_pod_fill(best_pod, best_cov)
+        latest = get_pod_location(best_pod.pod_id)
+        if latest:
+            best_pod.pos_x, best_pod.pos_y = int(latest[0]), int(latest[1])
+        station_replenish.add_pod(best_pod.pod_id)
+        new_job = RobotJob(best_pod.coordinate, station_id=station_replenish.station_id, pod=best_pod)
+        new_job.add_replenishment_task(best_pod)
+        best_pod.last_trigger = 'v12_fetch'
+        best_pod.last_opp_score = best_rank
+        self.pod_manager.mark_pod_not_available(best_pod)
+        with open('score_log.csv', 'a') as _f:
+            _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_rank:.6f},"
+                     f"0.000000,{best_rank:.6f},0.000000\n")
+        nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+        return False                             # just-picked pod returns to storage
+
+    def _dispatch_piggyback_ranked_v13(self, picked_pod=None, picking_robot=None, picked_skus=None):
+        """ORS v13 — identical mechanism to v12 (event-driven, ONE pod per picking
+        event, piggyback-or-fetch) but ranks candidates with the WEIGHTED-SUM score
+        Score = W_G·urgency + W_E·emptiness (see _v13_pod_score) instead of v12's
+        multiplicative Σ g·(1−cur/lim). The weights trade off anti-stockout (W_G)
+        against trip-efficiency (W_E); vary them for a Pareto frontier.
+
+        At finish-picking: rank the just-picked pod together with all idle, non-queued
+        pods carrying critical SKUs; take the single top scorer. If it is the
+        just-picked pod → PIGGYBACK (True); if an idle pod → FETCH it once (False);
+        if nothing scores > 0 → pod returns to storage (False).
+        """
+        if picked_pod is None:
+            return False
+        critical = self._build_critical_set()
+        if not critical:
+            return False
+
+        # GATE (piggyback trigger): the just-picked pod must hold AT LEAST ONE globally
+        # critical SKU (current_global <= rop_global) for this picking event to trigger a
+        # replenishment decision — same gate as v12, so v12 and v13 differ ONLY in the
+        # scoring formula, not in when evaluation fires. Without it, every finish-picking
+        # re-evaluated the whole warehouse (dispatch tracked the picking rate, not the ROP).
+        if not any(s in critical for s in picked_pod.skus):
+            return False
+
+        queued_pod_ids = {j.pod.pod_id for j in self.job_queue if j.pod is not None}
+        candidates = [picked_pod] + [
+            p for p in self.pod_manager.pods
+            if p.pod_id != picked_pod.pod_id
+            and self.pod_manager.is_idle(p.pod_id)
+            and p.pod_id not in queued_pod_ids
+        ]
+        best_pod, best_rank, best_cov = None, 0.0, None
+        for pod in candidates:
+            rank, cov = self._v13_pod_score(pod, critical)
+            if not cov:
+                continue
+            if rank > best_rank:
+                best_pod, best_rank, best_cov = pod, rank, cov
+
+        if best_pod is None or best_rank <= 0.0:
+            return False                         # nothing worthwhile → pod to storage
+
+        # DIAGNOSTIC: log the winning pod's two score components (g vs emptiness) so we can
+        # measure how independent service vs efficiency are (low correlation → Pareto front
+        # has spread; high correlation → it collapses to a line).
+        with open('v13_components_log.csv', 'a') as _f:
+            _f.write(f"{int(self._tick)},{best_pod.pod_id},"
+                     f"{getattr(best_pod,'_last_g_pod',0):.6f},"
+                     f"{getattr(best_pod,'_last_emptiness_pod',0):.6f},{best_rank:.6f}\n")
+
+        # Winner is the just-picked pod → PIGGYBACK.
+        if best_pod.pod_id == picked_pod.pod_id:
+            self._reserve_pod_fill(picked_pod, best_cov)
+            picked_pod.last_trigger = 'v13_piggyback'
+            picked_pod.last_opp_score = best_rank
+            with open('score_log.csv', 'a') as _f:
+                _f.write(f"{int(self._tick)},{picked_pod.pod_id},{best_rank:.6f},"
+                         f"0.000000,{best_rank:.6f},0.000000\n")
+            return True
+
+        # Winner is an idle pod.
+        # If fetch is disabled, do NOT dispatch it — leave it to be served the next
+        # time it passes through picking. The just-picked pod returns to storage. This
+        # makes every replenishment a piggyback (zero fetch trips) across all weights.
+        if not V13_ALLOW_FETCH:
+            return False
+        # Otherwise FETCH it once.
+        station_replenish = self.station_manager.find_available_replenish_station()
+        if station_replenish is None:
+            return False
+        nearest_robot, current_distance = None, float('inf')
+        for o in self.get_movable_objects():
+            if o.object_type == 'robot' and (o.job is None or o.job.is_finished) and o.current_state == 'idle':
+                dist = calculateDistance(o.pos_x, o.pos_y, best_pod.pos_x, best_pod.pos_y)
+                if dist < current_distance:
+                    nearest_robot, current_distance = o, dist
+        if nearest_robot is None:
+            return False
+        self._reserve_pod_fill(best_pod, best_cov)
+        latest = get_pod_location(best_pod.pod_id)
+        if latest:
+            best_pod.pos_x, best_pod.pos_y = int(latest[0]), int(latest[1])
+        station_replenish.add_pod(best_pod.pod_id)
+        new_job = RobotJob(best_pod.coordinate, station_id=station_replenish.station_id, pod=best_pod)
+        new_job.add_replenishment_task(best_pod)
+        best_pod.last_trigger = 'v13_fetch'
+        best_pod.last_opp_score = best_rank
+        nearest_robot.assign_job_and_set_move_to_take_pod(new_job)
+        self.pod_manager.mark_pod_not_available(best_pod)
+        with open('score_log.csv', 'a') as _f:
+            _f.write(f"{int(self._tick)},{best_pod.pod_id},{best_rank:.6f},"
+                     f"0.000000,{best_rank:.6f},0.000000\n")
+        return False                             # just-picked pod returns to storage
 
     def _dispatch_proactive_replenishment_v6(self, extra_pod=None, picked_skus=None):
         """
@@ -600,9 +1649,9 @@ class Inventory(Universe):
           dropped; other SKUs in the pod are unchanged since the last visit, so
           rechecking them is redundant):
               critical(s)  <=>  current_global(s)  <= rop_global(s)        (warehouse ROP)
-                            AND  current_in_pod(s) <= rop_per_pod(s)        (per-pod ROP)
+                            AND  slot_stock(s)     <= rop_per_slot(s)       (per-slot ROP)
           Both reorder points must be reached: the warehouse stock of SKU s is at its
-          global reorder point AND this pod's own slot for s is at its per-pod reorder
+          global reorder point AND this pod's own slot for s is at its per-slot reorder
           point. The two-level AND is the entire admission test — it replaces the
           theta gate. It is justifiable as classic (s) reorder logic applied at two
           inventory levels (warehouse + pod), not a tuned parameter.
@@ -638,18 +1687,19 @@ class Inventory(Universe):
             if TRIGGER_ON_EMPTY_ONLY:
                 # Extreme lower-bound (A2): two-level ROP with BOTH thresholds = 0.
                 # Reorder only when the SKU is depleted globally (current_global <= 0)
-                # AND the slot is empty in this pod (current_in_pod <= 0). No safety
+                # AND every slot is empty in this pod (per-slot stock <= 0). No safety
                 # stock at either level. Theoretical worst case.
                 d_glob = self.pod_manager.skus_data.get(s_id, {})
                 global_empty = d_glob.get('current_global_qty', 1) <= 0
-                if global_empty and cur <= 0:
+                if global_empty and Pod.slot_stock(s) <= 0:
                     critical = True
                 continue
             d = self.pod_manager.skus_data.get(s_id, {})
             global_ok = d.get('current_global_qty', 1) <= d.get('rop_global', 0)
-            rpp = float(s.get('rop_per_pod', 0))
-            per_pod_ok = rpp > 0 and cur <= rpp
-            if global_ok and per_pod_ok:
+            # Per-slot ROP: at least one slot of this SKU in this pod is at/under
+            # rop_per_slot (per-slot stock = current_qty / n_slots_in_pod).
+            per_slot_ok = Pod.is_slot_low(s)
+            if global_ok and per_slot_ok:
                 critical = True
 
         if not critical:
@@ -664,194 +1714,67 @@ class Inventory(Universe):
             )
         return True
 
-    def _pod_opportunity_score(self, pod, pending_demand: dict = None):
-        """Opportunity score of a pod.
-
-            score(pod) = Σ_{i: current_i < rop_global_i}
-                             pending_demand_i × (limit_qty_i − current_qty_i)
-
-          Filter  current_i < rop_global_i:
-                    Only SKUs already below their reorder point contribute.
-                    Consistent with the global trigger condition.
-
-          Weight  pending_demand_i:
-                    Units of SKU i currently required by unfinished orders
-                    assigned to a picking station (committed real-time demand).
-                    Fallback to mean_daily_demand when pending = 0 so that
-                    high-demand SKUs retain baseline priority even with no
-                    active orders.
-
-          Gap     limit_qty_i − current_qty_i:
-                    How much inventory will actually be restored if this pod
-                    is replenished (filled to slot capacity). Reflects the
-                    true benefit of the trip, not just the ROP shortfall.
-
-          Interpretation: the score approximates how many pending-order units
-          can be unblocked by sending this pod to replenishment now.
-          Higher score = more worthwhile trip.
-        """
-        if pending_demand is None:
-            pending_demand = {}
-        score = 0.0
-        for s_id, s in pod.skus.items():
-            cur   = float(s.get('current_qty', 0))
-            limit = float(s.get('limit_qty', 0))
-            d     = self.pod_manager.skus_data.get(s_id, {})
-            rop   = float(d.get('rop_global', 0))
-            # Only SKUs below reorder point contribute
-            if cur >= rop:
-                continue
-            room = limit - cur                       # units restored if replenished
-            if room <= 0:
-                continue
-            # Real-time pending demand; fallback to historical mean if zero
-            pending = float(pending_demand.get(s_id, 0))
-            if pending == 0:
-                pending = float(d.get('mean_daily_demand', 0.0))
-            score += pending * room
-        return score
-
     def _dispatch_proactive_replenishment_v7(self, extra_pod=None, picked_skus=None):
         """
-        ORS v7 — IDENTICAL to v6 (reactive piggyback, two-level ROP, no extra
-        trip) EXCEPT the trigger scope is ALL SKUs in the pod, not only the
-        just-picked ones.
+        ORS v7 — PIGGYBACK + OPPORTUNITY SCORE.
 
-          Trigger (scope = just-PICKED SKUs, same as v6):
-              critical(s) <=> effective_global(s) <= rop_global(s)    (warehouse ROP)
-                          AND  current_in_pod(s)  <= rop_per_pod(s)    (per-pod ROP)
-              where effective_global(s) = current_global(s) + reserved_global(s).
+        The just-picked pod (extra_pod) is already in the robot's hands at the
+        station. v7 decides — AT THIS MOMENT (finish-picking) — whether to send it
+        straight to replenishment (piggyback, the robot continues; NO fetch trip) or
+        let it return to storage. Because the decision is made when the pod is already
+        free, nothing is held back — this avoids the "pod tied up" failure of the old
+        v7 (which reserved pods while they were still being picked, stalling them).
 
-        Difference vs v6: the warehouse-level check uses EFFECTIVE global stock,
-        which adds units already promised by pods in transit to replenishment
-        (reserved_global). This suppresses a redundant second trip for a popular
-        SKU that an in-flight pod will already restock above its ROP, while still
-        dispatching a pod whose picked SKU is not yet backed up by anyone. The
-        net effect is FEWER trips — the right direction in a robot-bound regime.
+        Decision rule — piggyback iff the pod carries ≥1 SKU that is BOTH:
+            (i)  critical at the warehouse level:  effective_global(s) ≤ rop_global(s)
+                 with effective_global(s) = current_global(s) + reserved_global(s)
+                 (a SKU an in-flight pod already restocks above ROP is NOT critical →
+                  no redundant second trip), AND
+            (ii) low in THIS pod's slot:           slot_stock(s) ≤ rop_per_slot(s)
+                 with room to refill (current < limit), AND
+            (iii) actually awaited by a waiting order: pending(s) > 0.
 
-        Returns True if extra_pod is selected for replenishment, False otherwise.
+        The opportunity score (Σ pending·urgency, via _v9_pod_score) is used to RANK
+        whether the piggyback is worthwhile: score > 0 means this pod can serve real
+        committed demand for a critical SKU. Pods carrying critical SKUs that NO order
+        is waiting on (pending = 0) score 0 and are NOT diverted — the same relevance
+        gate as v9, so v7 piggybacks exactly the pods v9 would have fetched, but for
+        free when they happen to pass through picking. SKUs critical but not passing
+        through picking are still served by the event-driven fetch scan in the main
+        loop (_dispatch_replenishment_event).
+
+        Returns True if extra_pod is sent to replenishment, False otherwise.
         """
         if extra_pod is None:
             return False
 
-        # total_space over ALL SKUs (refill-to-full worth of this trip, for logging).
+        # Opportunity score over the pod's critical-AND-awaited SKUs. Reuses the v9
+        # scorer so v7 (piggyback) and v9 (fetch) apply an identical relevance test;
+        # the only difference is v7 gets the pod for free (already at the station).
+        critical = self._build_critical_set()
+        if not critical:
+            return False
+        pending = self._compute_pending_demand()
+        score, covered = self._v9_pod_score(extra_pod, critical, pending)
+        if not covered or score <= 0.0:
+            return False                        # nothing critical+awaited → return pod
+
+        # Reserve the in-flight refill for exactly the covered SKUs, so other pods'
+        # triggers (and the fetch scan) are suppressed for SKUs this pod will restock
+        # — preventing a redundant second trip for the same popular SKU.
+        self._reserve_pod_fill(extra_pod, covered)
+
         total_space = sum(
             max(0.0, float(s.get('limit_qty', 0)) - float(s.get('current_qty', 0)))
             for s in extra_pod.skus.values()
         )
-
-        # Two-level ROP over the just-PICKED SKUs only (same scope as v6 — proven
-        # better than checking all slots, which over-triggers and adds trips).
-        # The trigger uses EFFECTIVE global stock = current_global + reserved_global,
-        # where reserved_global counts units that in-flight pods (already on the way
-        # to a replenishment station) will restock for this SKU. So a picked SKU is
-        # NOT critical if an in-flight pod already covers it above ROP — preventing a
-        # redundant second trip for the SAME popular SKU. A pod is still dispatched
-        # if it carries a picked SKU not yet backed up by anyone.
-        scope = set(picked_skus) if picked_skus else set(extra_pod.skus.keys())
-        critical = False
-        for s_id in scope:
-            s = extra_pod.skus.get(s_id)
-            if s is None:
-                continue
-            cur = float(s.get('current_qty', 0))
-            limit = float(s.get('limit_qty', 0))
-            if cur >= limit:
-                continue  # slot full — refilling it does nothing
-            d = self.pod_manager.skus_data.get(s_id, {})
-            effective_global = (d.get('current_global_qty', 1)
-                                + self.reserved_global.get(s_id, 0.0))
-            global_ok = effective_global <= d.get('rop_global', 0)
-            rpp = float(s.get('rop_per_pod', 0))
-            per_pod_ok = rpp > 0 and cur <= rpp
-            if global_ok and per_pod_ok:
-                critical = True
-                break
-
-        if not critical:
-            return False
-
-        # Reserve the refill this pod will deliver — but ONLY for the picked SKUs
-        # (symmetric with the trigger). Reserving every slot would falsely promise
-        # backup for non-picked SKUs that merely happen to sit in this pod,
-        # wrongly suppressing other pods' triggers for them. Store the exact
-        # reserved amounts ON the pod so finish_replenishment_task releases
-        # precisely what was reserved (no residue/leak).
-        extra_pod.reserved_fill = {}
-        scope_reserve = set(picked_skus) if picked_skus else set(extra_pod.skus.keys())
-        for s_id in scope_reserve:
-            s = extra_pod.skus.get(s_id)
-            if s is None:
-                continue
-            fill = float(s.get('limit_qty', 0)) - float(s.get('current_qty', 0))
-            if fill > 0:
-                self.reserved_global[s_id] += fill
-                extra_pod.reserved_fill[s_id] = fill
-
-        extra_pod.last_opp_score = total_space
-        extra_pod.last_trigger = 'two_level_rop_allsku'
+        extra_pod.last_opp_score = score
+        extra_pod.last_trigger = 'piggyback_score'
         with open('score_log.csv', 'a') as _f:
             _f.write(
-                f"{int(self._tick)},{extra_pod.pod_id},{total_space:.6f},"
+                f"{int(self._tick)},{extra_pod.pod_id},{score:.6f},"
                 f"0.000000,{total_space:.6f},0.000000\n"
             )
-        return True
-
-    def _dispatch_proactive_replenishment_v2(self, extra_pod=None, picked_skus=None):
-        """
-        ORS v2 — simple/direct: evaluate ONLY the just-picked pod (extra_pod).
-
-        Criticality is checked over the just-PICKED SKUs (picked_skus): at least one
-        picked SKU must be critical (current_global <= rop_global) with room to refill.
-        The gate's pod_gap, however, is computed over ALL SKUs in the pod, so a pod
-        still full of other SKUs is held back (picked-only pod_gap biases high and
-        floods trips). If it passes the gate (pod_gap >= theta*(1 - urgency_max)),
-        dispatch extra_pod itself. No candidate search across idle pods, no ranking.
-
-        Returns True if extra_pod is selected for replenishment, False otherwise.
-        """
-        if extra_pod is None:
-            return False
-        scope = set(picked_skus) if picked_skus else set(extra_pod.skus.keys())
-        scope = {s for s in scope if s in extra_pod.skus}
-        critical_skus = {
-            sku for sku in scope
-            if self.pod_manager.skus_data.get(sku, {}).get('current_global_qty', 1)
-               <= self.pod_manager.skus_data.get(sku, {}).get('rop_global', 0)
-        }
-        if not critical_skus:
-            return False
-        # extra_pod must have room to refill at least one critical SKU
-        if all(extra_pod.skus[s]['current_qty'] >= extra_pod.skus[s]['limit_qty']
-               for s in critical_skus):
-            return False
-
-        # Criticality above used the picked SKUs (scope). The gate's pod_gap, however,
-        # is computed over ALL SKUs in the pod (scope_skus=None): a pod still full of
-        # other SKUs is not worth a trip. Restricting pod_gap to the picked SKUs would
-        # bias it high (just-picked SKUs are necessarily depleted) and flood trips.
-        pod_gap, total_space, urgency_max = self._compute_pod_score(
-            extra_pod, critical_skus
-        )
-        effective_threshold = REPLENISHMENT_THETA * (1.0 - urgency_max)
-        passed_gate = pod_gap >= effective_threshold
-        with open('gate_log.csv', 'a') as _gf:
-            _gf.write(
-                f"{int(self._tick)},{extra_pod.pod_id},{pod_gap:.6f},"
-                f"{urgency_max:.6f},{effective_threshold:.6f},"
-                f"{total_space:.6f},{int(passed_gate)}\n"
-            )
-        if not passed_gate:
-            return False
-
-        extra_pod.last_opp_score = total_space
-        extra_pod.last_trigger = 'opp_score'
-        with open('score_log.csv', 'a') as _f:
-            _f.write(
-                f"{int(self._tick)},{extra_pod.pod_id},{total_space:.6f},"
-                f"{pod_gap:.6f},{total_space:.6f},{urgency_max:.6f}\n"
-            )
-        # extra_pod selected — caller (finish_task_in_job) dispatches it via return True
         return True
 
     def insert_finished_order_to_csv(self, order: Order):
@@ -992,6 +1915,16 @@ class Inventory(Universe):
                     for sku, qty in remaining_skus.items():
                         sku_to_quantity[sku] += qty
                         sku_to_order_map[sku].append((o_id, qty))
+
+                # Stockout Count metric: a requested SKU whose WAREHOUSE stock is zero
+                # (all its pods empty, per Lamballais et al. 2018) is a true stockout for
+                # this order line. Recorded once per (order_id, sku) so it counts unique
+                # affected order lines, not per-tick retries.
+                for sku, orders_q in sku_to_order_map.items():
+                    sku_meta = self.pod_manager.skus_data.get(sku, {})
+                    if float(sku_meta.get('current_global_qty', 1)) <= 0:
+                        for o_id, _q in orders_q:
+                            self._stockout_orderlines.add((o_id, sku))
 
                 if not sku_to_quantity:
                     print(f"skipping pod search for station {station.station_id}")

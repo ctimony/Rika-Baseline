@@ -4,14 +4,19 @@
 ABC classification of SKUs using K-Means clustering (k=3)
 based on demand characteristics from clean_orders.
 
-Features used:
-- order_frequency : number of unique orders containing the SKU
-- total_quantity  : total units ordered across all orders
+Clustering feature:
+- order_frequency : number of unique orders containing the SKU.
+                    Log1p-transformed (to compress the right-skew) then
+                    standardised (StandardScaler) before clustering.
+                    This is the ONLY feature used for K-Means.
+
+Note: total_quantity is also computed and saved to the output for reference,
+but it is NOT used as a clustering feature.
 
 Steps:
-1. Compute demand features from 02_clean_orders.csv
-2. Normalize features (StandardScaler)
-3. Elbow method (k=1..10) to confirm optimal k
+1. Compute order_frequency per SKU from 02_clean_orders.csv
+2. Log1p-transform + standardise the feature
+3. Elbow method (k=1..10) to confirm the chosen k
 4. K-Means k=3, assign labels A/B/C (A=highest demand)
 5. Save results and elbow plot
 

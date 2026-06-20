@@ -1,11 +1,11 @@
 Raw orders: 321,314
-After drop nulls: 321,314 (removed 0)
-After consolidate duplicates: 308,980 (merged 12,334 dupes)
-After item_volume > 60,000 filter: 274,632 (removed 34,348)
-After qty > max_qty_per_slot filter: 268,748 (removed 5,884)
-After clean_skus_pod3 filter: 268,748 (removed 0)
+After drop identical rows: 316,485 (removed 4,829)
+After drop nulls: 316,485 (removed 0)
+After consolidate duplicates: 308,980 (merged 7,505)
+After item/box_volume > 60,000 filter: 280,435 (removed 28,545)
+After qty > max_qty_per_slot filter: 274,646 (removed 5,789)
 
-Final clean orders: 268,748
-Unique orders: 53,492
-Unique items: 7,066
-Total removed: 52,566 (16.4%)
+Final clean orders: 274,646
+Unique orders: 55,119
+Unique items: 7,075
+Total removed: 46,668 (14.5%)

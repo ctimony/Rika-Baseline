@@ -28,9 +28,13 @@ class PodManager:
             self.sku_to_pods[sku].append(pod)
 
     def add_sku_to_pod(self, sku: int, pod: Pod):
+        # Called once per slot row; a SKU stacked over k slots in the same pod
+        # would otherwise append that pod k times. Keep each pod once so
+        # sku_to_pods maps SKU -> list of DISTINCT pods holding it.
         if sku not in self.sku_to_pods:
             self.sku_to_pods[sku] = []
-        self.sku_to_pods[sku].append(pod)
+        if pod not in self.sku_to_pods[sku]:
+            self.sku_to_pods[sku].append(pod)
 
     def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0, item_class='C', n_slots=1, demand_rate=0.0):
         sku_id = sku

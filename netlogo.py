@@ -205,6 +205,7 @@ stations = [
 
 def initRobots(universe: Inventory):
 
+    random.seed(42)  # fixed robot start positions for reproducible policy comparison
     num_robot = 20  # Number of robots
 
     robots = []
@@ -268,10 +269,10 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     config_orders(
         initial_order=100,
-        total_requested_item=4000,
+        total_requested_item=6090,
         items_orders_class_configuration={"A": 0.8, "B": 0.15, "C": 0.05},
         quantity_range=[1, 12],
-        order_cycle_time=150,
+        order_cycle_time=200,  # orders/hour (Poisson λ·60)
         order_period_time=8,
         order_start_arrival_time=0,
         date=1,
@@ -314,8 +315,12 @@ def cluster_backlog_orders(jaccard_similarities, total_station, station_capacity
     cluster_labels = [-1] * len(jaccard_similarities_list)
     station_remaining_capacity = station_capacity_df['capacity_left'].tolist()
 
-    # K-Means clustering
-    kmeans = KMeans(n_clusters=total_station)
+    # K-Means clustering. Fixed random_state so the order→station clustering is
+    # deterministic across runs: within one replication every scenario (baseline,
+    # proposed at each weight) sees the same clustering, so differences come from
+    # the policy, not from KMeans' random initialisation. Variation across
+    # replications comes from regenerating the order set, not from this seed.
+    kmeans = KMeans(n_clusters=total_station, random_state=42)
     kmeans.fit(jaccard_similarities_list)
 
     cluster_labels1 = kmeans.labels_
@@ -758,17 +763,25 @@ def generate_rop_summary():
     assigned = pods[pods['max_qty'] > 0]
     s_total = assigned.groupby('item')['max_qty'].sum().reset_index()
     s_total.columns = ['item_id', 's_total']
-    pods_per_item = assigned.groupby('item')['pod_id'].nunique().reset_index()
-    pods_per_item.columns = ['item_id', 'num_pods']
 
     result = active.merge(s_total, on='item_id', how='left')
-    result = result.merge(pods_per_item, on='item_id', how='left')
     result['s_total'] = result['s_total'].fillna(0).astype(int)
-    result['num_pods'] = result['num_pods'].fillna(1).astype(int)
-    result['rop_per_pod'] = _np.ceil(result['rop_global'] / result['num_pods']).astype(int)
 
-    output = result[['item_code', 'item_id', 'num_pods', 's_total', 'rop_global', 'rop_per_pod']].copy()
-    output = output.rename(columns={'num_pods': 'n_slots'})
+    # n_slots = slots_needed: the SKU's TOTAL number of slots across the warehouse
+    # (from items_dictionary). The old code stored num_pods (distinct pods) under
+    # this name, which is wrong — a SKU can occupy several slots in one pod.
+    result['n_slots'] = result['slots_needed'].clip(lower=1).astype(int)
+
+    # Per-SLOT reorder point — the only ROP the triggers use now: rop_global spread
+    # evenly over the SKU's total slots (rop_global / n_slots). A slot is "low" iff
+    # its stock <= rop_per_slot. Because slots of one SKU fill uniformly, the
+    # per-slot stock is current_qty_in_pod / n_slots_in_that_pod. rop_per_slot is the
+    # same value for every pod holding the SKU — each pod's own slot count enters at
+    # trigger time, making the check fair across pods with different slot counts.
+    result['rop_per_slot'] = _np.ceil(result['rop_global'] / result['n_slots']).astype(int)
+
+    output = result[['item_code', 'item_id', 'n_slots', 's_total',
+                     'rop_global', 'rop_per_slot']].copy()
     output = output.sort_values('item_id').reset_index(drop=True)
     output.to_csv('rop_summary.csv', index=False)
     print(f"Generated rop_summary.csv — {len(output)} SKUs")
@@ -777,8 +790,13 @@ def generate_rop_summary():
 def assign_skus_to_pods(pod_manager):
     # Check if pods.csv exists in the current directory
     if not os.path.exists('pods.csv'):
-        PodGenerator(pod_types=[3], pod_num=[468], total_sku=4000,
-                      items_class_conf={"A": 0.171, "B": 0.389, "C": 0.440},
+        # SKU set comes from data_mining/output/06_sampled_skus.csv (impact-quartile
+        # priority fill: Q4 kept in full, drops fall only on the lowest quartile;
+        # 6090 SKUs sized to the 489-pod budget). total_sku / items_class_conf below
+        # reflect that subset (A=20.0%, B=41.4%, C=38.7%); gen_items reads the
+        # sampled list directly.
+        PodGenerator(pod_types=[3], pod_num=[489], total_sku=6090,
+                      items_class_conf={"A": 0.1995, "B": 0.4138, "C": 0.3867},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
                       items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2},
@@ -793,9 +811,10 @@ def assign_skus_to_pods(pod_manager):
 def assign_skus_to_pods_from_file(pod_manager: PodManager):
     import pandas as _pd
     rop_df = _pd.read_csv('rop_summary.csv')
-    rop_dict = dict(zip(rop_df['item_id'].astype(int),
-                        zip(rop_df['rop_global'].astype(int), rop_df['rop_per_pod'].astype(int))))
+    rop_global_dict = dict(zip(rop_df['item_id'].astype(int), rop_df['rop_global'].astype(int)))
     n_slots_dict = dict(zip(rop_df['item_id'].astype(int), rop_df['n_slots'].astype(int)))
+    # Per-slot reorder point — the only ROP the triggers use (rop_global / n_slots).
+    rop_per_slot_dict = dict(zip(rop_df['item_id'].astype(int), rop_df['rop_per_slot'].astype(int)))
 
     import pandas as _pd_cls
     _items_cls = _pd_cls.read_csv('items.csv').reset_index()
@@ -816,12 +835,13 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
             global_threshold_inv_level = row['item_warehouse_inventory_level']
             weight = float(row['item_weight'])
 
-            rop_global_val, rop_per_pod_val = rop_dict.get(sku, (1, 1))
+            rop_global_val = rop_global_dict.get(sku, 1)
+            rop_per_slot_val = rop_per_slot_dict.get(sku, 1)
 
             # Find the pod by id
             pod: Pod = pod_manager.get_pod_by_id(pod_id)
             pod.add_sku(sku, limit_qty=limit_qty, current_qty=current_qty, threshold=threshold,
-                        weight=weight, rop_per_pod=rop_per_pod_val)
+                        weight=weight, rop_per_slot=rop_per_slot_val)
             pod_manager.add_sku_to_pod(sku, pod)
 
             # Add SKU Data of level
@@ -846,6 +866,9 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
 
     with open('score_log.csv', 'w') as _f:
         _f.write("tick,pod_id,score,pod_gap,total_space,urgency_max\n")
+
+    with open('replenish_trigger_log.csv', 'w') as _f:
+        _f.write("tick,pod_id,sku,item_class,trigger\n")
 
     with open('gate_log.csv', 'w') as _f:
         _f.write("tick,pod_id,pod_gap,urgency_max,eff_threshold,total_space,passed\n")
@@ -956,6 +979,8 @@ def console_tick():
                 'job_queue_len': len(universe.job_queue),
                 'stop_and_go': universe.stop_and_go - prev_stop_and_go,
                 'turning': universe.total_turning - prev_turning,
+                'load_mass': round(getattr(universe, '_tick_load_mass', 0.0), 3),
+                'moving_robots': getattr(universe, '_tick_moving_robots', 0),
             })
             prev_energy = universe.total_energy
             prev_turning = universe.total_turning
@@ -1057,6 +1082,12 @@ def console_tick():
             print(f"  Wait cause:        stockout {_ws} ({_ws/_wtot*100:.0f}%) vs robot-busy {_wr} ({_wr/_wtot*100:.0f}%)")
         summary['wait_stockout'] = _ws
         summary['wait_robot'] = _wr
+        _stockout_count = len(getattr(universe, '_stockout_orderlines', set()))
+        print(f"  Stockout count:    {_stockout_count} order-lines (SKU stock = 0 when requested)")
+        summary['stockout_count'] = _stockout_count
+        _net = getattr(universe, '_v13_net_fetches', 0)
+        print(f"  v13 stockout-net fetches: {_net} (deadlock guard; {_net/total_replenishments*100:.1f}% of trips)" if total_replenishments > 0 else f"  v13 stockout-net fetches: {_net}")
+        summary['v13_net_fetches'] = _net
         print(f"  Results saved to:  {result_dir}")
         print("==============================\n")
 

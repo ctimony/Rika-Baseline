@@ -18,22 +18,20 @@ assigned = pods[pods['max_qty'] > 0]
 s_total = assigned.groupby('item')['max_qty'].sum().reset_index()
 s_total.columns = ['item_id', 's_total']
 
-# Number of pods per item
-pods_per_item = assigned.groupby('item')['pod_id'].nunique().reset_index()
-pods_per_item.columns = ['item_id', 'num_pods']
-
 # Merge
 result = active.merge(s_total, on='item_id', how='left')
-result = result.merge(pods_per_item, on='item_id', how='left')
 result['s_total'] = result['s_total'].fillna(0).astype(int)
-result['num_pods'] = result['num_pods'].fillna(1).astype(int)
 
-# ROP per pod = ceil(rop_global / num_pods)
-result['rop_per_pod'] = np.ceil(result['rop_global'] / result['num_pods']).astype(int)
+# n_slots = total slots that hold this SKU across the warehouse (items_dictionary).
+# ROP per slot = ceil(rop_global / n_slots). The per-slot reorder point makes the
+# pod-level trigger proportional: a pod's slot is "low" iff its per-slot stock
+# (current_qty / n_slots_in_pod) <= rop_per_slot, regardless of how many slots a
+# given pod devotes to the SKU (pods may hold the same SKU in different slot counts).
+result['n_slots'] = result['slots_needed'].clip(lower=1).astype(int)
+result['rop_per_slot'] = np.ceil(result['rop_global'] / result['n_slots']).astype(int)
 
 # Final output
-output = result[['item_code', 'item_id', 'num_pods', 's_total', 'rop_global', 'rop_per_pod']].copy()
-output = output.rename(columns={'num_pods': 'n_slots'})
+output = result[['item_code', 'item_id', 'n_slots', 's_total', 'rop_global', 'rop_per_slot']].copy()
 output = output.sort_values('item_id').reset_index(drop=True)
 
 output.to_csv('rop_summary.csv', index=False)
@@ -41,8 +39,8 @@ print(f"Saved rop_summary.csv — {len(output)} SKUs")
 print(f"\nROP global read from items_dictionary.csv (per-class Z: A/CV0=99%, A/CV1=B/CV1=95%, rest=90%)")
 print(f"\nROP global stats:")
 print(output['rop_global'].describe())
-print(f"\nROP per pod stats:")
-print(output['rop_per_pod'].describe())
+print(f"\nROP per slot stats:")
+print(output['rop_per_slot'].describe())
 print(f"\nS total stats:")
 print(output['s_total'].describe())
 print(f"\nSample output:")
