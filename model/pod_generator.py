@@ -11,7 +11,7 @@ from model.pod_manager import PodManager
 class PodGenerator:
     def __init__(self, pod_types, pod_num, total_sku, items_class_conf, items_pods_inventory_levels,
                  items_warehouse_inventory_levels, items_pods_class_conf, pod_manager: PodManager,
-                 pod_wmax: float = 600.0, dev_mode=False):
+                 dev_mode=False):
         self.pod_types = pod_types
         self.total_sku = total_sku
         self.pod_num = pod_num
@@ -19,7 +19,6 @@ class PodGenerator:
         self.items_pods_inventory_level = items_pods_inventory_levels
         self.items_warehouse_inventory_levels = items_warehouse_inventory_levels
         self.items_pods_class_conf = items_pods_class_conf
-        self.pod_wmax = pod_wmax
         self.dev_mode = dev_mode
 
         self.pod_manager = pod_manager
@@ -168,8 +167,14 @@ class PodGenerator:
             items.reset_index(drop=True, inplace=True)
             items.index.name = "item_id"
 
-            items_weight = items["box_weight"] / items["number_of_item_in_a_box"]
-            items.insert(11, "item_weight", items_weight.round(3))
+            # item_weight UNIFORM = 0.2 kg/unit for all SKUs: controls the experiment so pod
+            # mass (Σ item_weight × current_qty) reflects ONLY the number of units carried,
+            # not per-SKU weight differences. This isolates the replenishment-policy effect on
+            # energy (pod mass) — variation in mass comes purely from how many units a trip
+            # moves (policy/fill-rate), not from which SKU is heavy. 0.2 is a realistic small-
+            # moving-item weight (within the original distribution, p25≈0.18) → pod mass ~200–
+            # 680 kg, matching real RMFS pod loads, instead of the inflated values from w=1.
+            items.insert(11, "item_weight", 0.2)
             items[["item_order_frequency", "number_of_item_in_a_box"]] = items[[
                 "item_order_frequency", "number_of_item_in_a_box"]].astype(int)
 

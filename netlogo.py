@@ -801,7 +801,6 @@ def assign_skus_to_pods(pod_manager):
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
                       items_pods_class_conf={"A": 0.7, "B": 0.1, "C": 0.2},
                       pod_manager=pod_manager,
-                      pod_wmax=1000.0,
                       dev_mode=False).generate()
     if not os.path.exists('rop_summary.csv'):
         generate_rop_summary()

@@ -92,12 +92,12 @@ V13_STOCKOUT_NET = False
 #       score dispatched; if just-picked pod wins, it goes directly (no extra trip).
 #   8 = CriticalDemandCoverage × TotalRefillGap over IDLE pods, event-driven fetch.
 #   9 = opportunity-SCORED ranking (Σ pending·urgency) over IDLE pods, event-driven fetch.
-ORS_VERSION = 13             # active: v12 (opportunity score, multiplicative); proposed policy
+ORS_VERSION = 13             # active version (see dispatch table below)
 #  13 = weighted-sum opportunity score: Score = W_G·g(urgency) + W_E·emptiness
 #       (event-driven, evaluated at finish-picking). The two weights trade off
 #       service (anti-stockout) vs trip-efficiency; vary them for a Pareto front.
-V13_W_G = 0.5                # weight on g (urgency / anti-stockout)   — vary for Pareto
-V13_W_E = 0.5                # weight on emptiness (trip-efficiency)   — V13_W_G + V13_W_E = 1
+V13_W_G = 0.3                # weight on g (urgency / anti-stockout)   — vary for Pareto
+V13_W_E = 0.7                # weight on emptiness (trip-efficiency)   — V13_W_G + V13_W_E = 1
 # FILL RATE: at the replenishment station, refill each TRIGGERING (critical) SKU up to
 # V12_FILL_RATE × limit_qty (only those SKUs, not the whole pod). 1.0 = full; <1 leaves
 # slots partly filled → lower pod mass → lower travel energy (prof's energy lever).
@@ -592,7 +592,7 @@ class Inventory(Universe):
             return False
         # Layer 2 — Q_p = Σ U_ip(flagged) / |n_p| >= KL
         # cap=8: per-pod SKU-count denominator capped at 8 (Chou et al. original).
-        if pod.check_pod_index(flagged, BASELINE_KL, cap=8):
+        if pod.check_pod_index(flagged, BASELINE_KL, cap=6):
             pod.last_trigger = 'global'
             # Refill ONLY the flagged (critical) SKUs — same critical-only rule as the
             # opportunity-score policies (v12/v13), so the comparison is fair. flagged =
@@ -625,7 +625,22 @@ class Inventory(Universe):
         #     (reserved_fill = the covered critical set), matching v12's critical-only
         #     score Σ g_i·(1−cur/lim) → score and refill are consistent (both critical).
         #     No free-ride of non-critical SKUs; cleaner per-SKU pattern, lower pod mass.
-        whole_pod_fill = V12_FILL_WHOLE_POD and ORS_VERSION != 12
+        # WHOLE-POD fill applies to:
+        #   • v13 (and any opportunity-score policy with V12_FILL_WHOLE_POD), and
+        #   • the BASELINE's GLOBAL (proactive) trigger — the "Warehouse inventory-SKU in
+        #     pod" policy replenishes ALL SKUs in the pod once a pod is sent (Hsiao 2022,
+        #     "replenish all SKUs in this pod"). The baseline's STOCKOUT override is the
+        #     reactive exception below (stockout_fill) — it tops up ONLY the stocked-out
+        #     critical SKU, not the whole pod.
+        # v12 is the critical-only exception (whole_pod_fill stays False for ORS_VERSION 12).
+        if not USE_OPPORTUNITY_SCORE:
+            # BASELINE: global (proactive) trigger fills the WHOLE pod (Hsiao 2022);
+            # the stockout override fills ONLY the stocked-out critical SKU (stockout_fill).
+            whole_pod_fill = not stockout_fill
+        else:
+            # Opportunity-score policies: v13 (and any with V12_FILL_WHOLE_POD) = whole-pod;
+            # v12 = critical-only (whole_pod_fill stays False for ORS_VERSION 12).
+            whole_pod_fill = V12_FILL_WHOLE_POD and ORS_VERSION != 12
         if whole_pod_fill:
             # WHOLE-POD FILL: pod is at the station, so top up EVERY SKU (free-ride) up to
             # the fill rate, regardless of which SKUs triggered the trip. Raises pile-on

@@ -156,26 +156,6 @@ class Pod(Object):
         self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
         return added
 
-    def replenish_all_skus_capped(self, wmax: float):
-        """Replenish SKUs up to limit_qty but stop if cumulative pod mass would exceed wmax.
-        Returns dict {sku: qty_added} for caller to update global inventory tracker."""
-        remaining_capacity = wmax - self.mass
-        added = {}
-        for sku in sorted(self.skus, key=lambda s: self.skus[s]['weight'], reverse=True):
-            d = self.skus[sku]
-            needed = d['limit_qty'] - d['current_qty']
-            if needed <= 0:
-                continue
-            addable = int(min(needed, remaining_capacity // d['weight'])) if d['weight'] > 0 else needed
-            if addable > 0:
-                d['current_qty'] += addable
-                remaining_capacity -= addable * d['weight']
-                added[sku] = addable
-            if remaining_capacity <= 0:
-                break
-        self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
-        return added
-
     def pick_sku(self, sku, qty):
         self.skus[sku]['current_qty'] -= qty
         self.mass -= (self.skus[sku]['weight'] * qty)
