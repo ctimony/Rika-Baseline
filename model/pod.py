@@ -99,27 +99,28 @@ class Pod(Object):
             return True
         return False
 
-    def check_pod_index(self, flagged_skus, kl: float = 0.5, cap: int = 8) -> bool:
-        """Layer 2 of Warehouse Inventory-SKU in Pod baseline (Chou et al.).
+    def check_pod_index(self, flagged_skus, kl: float = 0.2) -> bool:
+        """Layer 2 of Warehouse Inventory-SKU in Pod baseline (Chou et al.; Tracy
+        Eq 3-5, Hsiao).
 
-        Q_p = (Σ_{i∈flagged} U_ip) / |n_p|,  where U_ip = current_qty/limit_qty
-        is the pod-level inventory utilization ratio of flagged SKU i, and |n_p|
-        is the number of SKUs in the pod, capped at `cap` (=8, or fewer if the pod
-        has fewer unique SKUs) so that pods with many at-risk SKUs are not
-        overlooked. R_p = 1 iff Q_p >= KL. Only SKUs flagged by Layer 1 are summed.
+        Q_p = (Σ_{i∈flagged} W_i) / n_p,  where W_i = 1 for each SKU flagged by
+        Layer 1 (BINARY count of at-risk SKUs in this pod, matching the published
+        baseline Q_j = ΣW_i/n_j — NOT the continuous utilisation ratio), and n_p is
+        the number of SKUs in the pod. R_p = 1 iff Q_p >= KL. Q_p is therefore the
+        TRUE fraction of the pod's SKUs that are flagged (critical), exactly as in
+        Tracy/Hsiao. With n_p = 20 SKUs per pod and KL = 0.2, the pod is dispatched
+        once at least 4 of its 20 SKUs (20%) are critical — the same trigger point as
+        the earlier capped-denominator form (Σ W_i / 8 >= 0.4), but with the true pod
+        SKU count as the denominator so Q_p reads as a genuine fraction.
         """
         if not self.skus or not flagged_skus:
             return False
         n_p = len(self.skus)
-        denom = min(n_p, cap) if cap else n_p
-        if denom <= 0:
+        if n_p <= 0:
             return False
-        sum_u_ip = 0.0
-        for sku in flagged_skus:
-            d = self.skus.get(sku)
-            if d is not None and d['limit_qty'] > 0:
-                sum_u_ip += d['current_qty'] / d['limit_qty']
-        q_p = sum_u_ip / denom
+        # W_i binary: count flagged SKUs actually present in this pod (each = 1).
+        w_sum = sum(1 for sku in flagged_skus if sku in self.skus)
+        q_p = w_sum / n_p
         return q_p >= kl
 
     def replenish_all_skus(self):
@@ -153,6 +154,48 @@ class Pod(Object):
             if cur < target:
                 added[sku] = target - cur
                 self.skus[sku]['current_qty'] = target
+        self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
+        return added
+
+    def replenish_pod_capacity(self, critical_skus, fill_rate: float = 1.0):
+        """Fill the pod up to fill_rate × TOTAL pod capacity (Σ limit_qty), CRITICAL
+        SKUs prioritised. Unlike replenish_skus_fillrate (which fills each slot to
+        fill_rate × its own limit), this targets the WHOLE-POD mass: critical SKUs are
+        topped to full first (so service is protected), then the remaining budget is
+        spread over non-critical SKUs until exhausted. fill_rate<1 leaves the pod
+        genuinely lighter (lower Σ current → lower mass → lower travel energy) — a
+        SHARP energy lever, because it caps total pod mass directly rather than shaving
+        a little off every slot. Items weigh 1 unit each, so units == mass == capacity.
+        Never removes stock. Returns dict of units added per SKU."""
+        budget = fill_rate * sum(d['limit_qty'] for d in self.skus.values())
+        added = {}
+        critical = set(critical_skus or [])
+        # Pass 1 — critical SKUs to full (priority; protects service).
+        for sku in critical:
+            d = self.skus.get(sku)
+            if d is None:
+                continue
+            room = d['limit_qty'] - d['current_qty']
+            if room > 0:
+                added[sku] = room
+                d['current_qty'] = d['limit_qty']
+        used = sum(d['current_qty'] for d in self.skus.values())
+        remaining = budget - used
+        # Pass 2 — spread remaining budget over non-critical SKUs (in pod order).
+        if remaining > 0:
+            for sku, d in self.skus.items():
+                if remaining <= 0:
+                    break
+                if sku in critical:
+                    continue
+                room = d['limit_qty'] - d['current_qty']
+                if room <= 0:
+                    continue
+                give = int(min(room, remaining))
+                if give > 0:
+                    added[sku] = added.get(sku, 0) + give
+                    d['current_qty'] += give
+                    remaining -= give
         self.mass = sum(d['weight'] * d['current_qty'] for d in self.skus.values())
         return added
 

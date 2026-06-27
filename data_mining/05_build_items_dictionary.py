@@ -67,7 +67,7 @@ POD3_SLOT_VOL = 60_000  # cm³
 # use 24 hours of Normal demand directly; intermittent/lumpy convert the 24-h day
 # into n_act/day bursts of burst-size demand. ROP is the lead time (1 h / 1 burst).
 INIT_HORIZON_SE_HOURS = 24   # smooth/erratic initial stock = one day
-ROP_HORIZON_SE_HOURS  = 1.0    # smooth/erratic ROP lead time = 1 hour
+ROP_HORIZON_SE_HOURS  = 2.0    # smooth/erratic ROP lead time = 1 hour
 ROP_HORIZON_IL_BURSTS  = 3   # intermittent/lumpy ROP = 1 burst
 
 # Service level (Z) is a function of ABC class ONLY — a proxy for item

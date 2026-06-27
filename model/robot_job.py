@@ -22,6 +22,7 @@ class RobotJob:
         self.replenishment_delay_per_sku = 20
         self.replenishment_delay = 0
         self.is_finished = False
+        self.start_tick = None
 
     def add_picking_task(self, order_id, sku, quantity):
         """Add an order with the specific SKU and quantity to be picked."""

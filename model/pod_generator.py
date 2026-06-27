@@ -167,14 +167,12 @@ class PodGenerator:
             items.reset_index(drop=True, inplace=True)
             items.index.name = "item_id"
 
-            # item_weight UNIFORM = 0.2 kg/unit for all SKUs: controls the experiment so pod
-            # mass (Σ item_weight × current_qty) reflects ONLY the number of units carried,
-            # not per-SKU weight differences. This isolates the replenishment-policy effect on
-            # energy (pod mass) — variation in mass comes purely from how many units a trip
-            # moves (policy/fill-rate), not from which SKU is heavy. 0.2 is a realistic small-
-            # moving-item weight (within the original distribution, p25≈0.18) → pod mass ~200–
-            # 680 kg, matching real RMFS pod loads, instead of the inflated values from w=1.
-            items.insert(11, "item_weight", 0.2)
+            # item_weight UNIFORM = 1.0 for all SKUs: controls the experiment so pod mass
+            # (Σ item_weight × current_qty) equals the NUMBER OF UNITS carried. This isolates
+            # the replenishment-policy effect on energy (pod mass) — variation in mass comes
+            # purely from how many units a trip moves (policy/fill-rate), not from which SKU
+            # is heavy. Mass reads directly as unit count (transparent).
+            items.insert(11, "item_weight", 1.0)
             items[["item_order_frequency", "number_of_item_in_a_box"]] = items[[
                 "item_order_frequency", "number_of_item_in_a_box"]].astype(int)
 
@@ -482,9 +480,15 @@ class PodGenerator:
                 cls_items["item_initial_quantity_inventory"]
                 / cls_items["max_item_in_slot"].clip(lower=1)
             ).astype(int)
-            # Hottest SKUs first so they cluster into the same (early) pods.
+            # Place MULTI-SLOT SKUs first (largest slots_needed), THEN hottest-first.
+            # A SKU needing N slots must land in N DISTINCT pods; if it is placed late
+            # (after most pods are full) too few distinct pods remain → dead-end. Sorting
+            # by slots_needed desc first gives big SKUs the distinct pods while supply is
+            # still spread out. Within equal slots_needed, hottest-first preserves the
+            # hot-pod grouping for the common 1-slot SKUs (the vast majority).
             cls_items = cls_items.sort_values(
-                ["item_order_frequency", "item_id"], ascending=[False, True]
+                ["__slots_needed", "item_order_frequency", "item_id"],
+                ascending=[False, False, True]
             )
             # Fill pods in a FIXED order (by pod_id) so consecutive hot SKUs share pods.
             pod_order = sorted(pod_class_cap[cls].keys())

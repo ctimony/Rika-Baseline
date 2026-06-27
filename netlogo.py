@@ -269,7 +269,7 @@ def draw_layout_from_generated_file(universe: Inventory):
 
     config_orders(
         initial_order=100,
-        total_requested_item=6090,
+        total_requested_item=5441,
         items_orders_class_configuration={"A": 0.8, "B": 0.15, "C": 0.05},
         quantity_range=[1, 12],
         order_cycle_time=200,  # orders/hour (Poisson λ·60)
@@ -792,10 +792,10 @@ def assign_skus_to_pods(pod_manager):
     if not os.path.exists('pods.csv'):
         # SKU set comes from data_mining/output/06_sampled_skus.csv (impact-quartile
         # priority fill: Q4 kept in full, drops fall only on the lowest quartile;
-        # 6090 SKUs sized to the 489-pod budget). total_sku / items_class_conf below
-        # reflect that subset (A=20.0%, B=41.4%, C=38.7%); gen_items reads the
-        # sampled list directly.
-        PodGenerator(pod_types=[3], pod_num=[489], total_sku=6090,
+        # 5,441 SKUs sized to the 489-pod budget at uniform 20-unit slots). total_sku /
+        # items_class_conf below reflect that subset; gen_items reads the sampled list
+        # directly.
+        PodGenerator(pod_types=[3], pod_num=[489], total_sku=5441,
                       items_class_conf={"A": 0.1995, "B": 0.4138, "C": 0.3867},
                       items_pods_inventory_levels={"A": 0.4, "B": 0.5, "C": 0.6},
                       items_warehouse_inventory_levels={"A": 0.3, "B": 0.4, "C": 0.5},
@@ -820,6 +820,15 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
     item_class_dict = dict(zip(_items_cls['item_id'], _items_cls['item_class']))
     # demand rate (mean daily demand) per SKU — used by the opportunity score (v7)
     demand_rate_dict = dict(zip(_items_cls['item_id'], _items_cls['mean_daily_demand']))
+    # Per-hour demand mean/std per SKU — used by the v16 stockout-probability score
+    # P_i = 1 − Φ((s − μ_h·L)/(σ_h·√L)). These are the SAME μ_h, σ_h that compute
+    # rop_global in 05_build_items_dictionary.py, joined from items_dictionary via item_code.
+    _items_dict = _pd_cls.read_csv('items_dictionary.csv')
+    _code_to_id = dict(zip(_items_cls['item_code'], _items_cls['item_id']))
+    _items_dict = _items_dict[_items_dict['item_code'].isin(_code_to_id)].copy()
+    _items_dict['item_id'] = _items_dict['item_code'].map(_code_to_id)
+    mean_hourly_dict = dict(zip(_items_dict['item_id'], _items_dict['mean_hourly_demand']))
+    std_hourly_dict = dict(zip(_items_dict['item_id'], _items_dict['std_hourly_demand']))
 
     with open('pods.csv', mode='r', newline='') as file:
         reader = csv.DictReader(file)
@@ -847,7 +856,9 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
             item_class = item_class_dict.get(int(sku), 'C')
             n_slots_val = n_slots_dict.get(int(sku), 1)
             demand_rate_val = float(demand_rate_dict.get(int(sku), 0.0))
-            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val, item_class, n_slots_val, demand_rate_val)
+            mean_hourly_val = float(mean_hourly_dict.get(int(sku), 0.0))
+            std_hourly_val = float(std_hourly_dict.get(int(sku), 0.0))
+            pod_manager.add_sku_data(sku, current_qty, limit_qty, global_threshold_inv_level, rop_global_val, item_class, n_slots_val, demand_rate_val, mean_hourly_val, std_hourly_val)
 
     csv_file = 'skus_data.csv'
     if os.path.exists(csv_file):
@@ -860,7 +871,7 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
         for key, value in skus_data.items():
             writer.writerow([key, value['current_global_qty'], value['max_global_qty'], value['global_inv_level']])
 
-    pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type", "trigger", "opp_score"])
+    pod_info = pd.DataFrame(columns=["pod_id", "item_id", "qty", "order_id", "processed_time", "task_type", "trigger", "opp_score", "trip_start", "trip_duration"])
     pod_info.to_csv("pod_info.csv", index=False)
 
     with open('score_log.csv', 'w') as _f:
@@ -871,6 +882,11 @@ def assign_skus_to_pods_from_file(pod_manager: PodManager):
 
     with open('gate_log.csv', 'w') as _f:
         _f.write("tick,pod_id,pod_gap,urgency_max,eff_threshold,total_space,passed\n")
+
+    # Diagnostic: per-evaluation record of whether the winning pod misses a near-stockout
+    # SKU carried by a losing candidate (tests "score skips about-to-stockout pods").
+    with open('score_diag.csv', 'w') as _f:
+        _f.write("tick,winner_pod,winner_score,n_candidates,winner_near_count,missed_near_count,missed_skus\n")
 
     print(f"Data has been saved to {csv_file}")
     df = pd.read_csv(csv_file)

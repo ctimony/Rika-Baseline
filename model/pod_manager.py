@@ -36,7 +36,7 @@ class PodManager:
         if pod not in self.sku_to_pods[sku]:
             self.sku_to_pods[sku].append(pod)
 
-    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0, item_class='C', n_slots=1, demand_rate=0.0):
+    def add_sku_data(self, sku, current_qty, max_qty, global_threshold_inv_level, rop_global=0, item_class='C', n_slots=1, demand_rate=0.0, mean_hourly=0.0, std_hourly=0.0):
         sku_id = sku
 
         if sku_id not in self.skus_data:
@@ -49,6 +49,10 @@ class PodManager:
                 'item_class': item_class,
                 'n_slots': n_slots,
                 'mean_daily_demand': demand_rate,
+                # Per-hour demand statistics — used by the v16 stockout-probability score
+                # P_i = 1 − Φ((s − μ_h·L)/(σ_h·√L)). Same μ_h, σ_h that compute rop_global.
+                'mean_hourly_demand': mean_hourly,
+                'std_hourly_demand': std_hourly,
             }
         else:
             self.skus_data[sku_id]['current_global_qty'] += current_qty

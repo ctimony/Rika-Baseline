@@ -1,2 +1,0 @@
-max_ticks,ticks,orders_finished,orders_generated,total_energy,stop_and_go,total_turning,peak_job_queue,avg_job_queue,avg_cycle_time,max_cycle_time,avg_oct,max_oct,order_throughput,total_replenishments,total_picks,replenishment_pick_ratio,total_units_picked,total_pod_visits,pod_utilization,skus_replenished,trip_efficiency,wait_stockout,wait_robot,stockout_count,v13_net_fetches
-28800,28800.0,1383,1553,98267.71,87873,66772,26,19.1,454.8,3692,1904.06,21003,0.8905,112,5159,0.0217,28356,4473,6.3394,487,4,5478,187487,51,0

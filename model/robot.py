@@ -933,11 +933,13 @@ class Robot(Object):
 
     def assign_job_and_set_move_to_take_pod(self, job: RobotJob):
         self.job = job
+        job.start_tick = self.universe._tick
 
         self.set_move_to_take_pod()
 
     def assign_job_and_set_move_to_station(self, job: RobotJob):
         self.job = job
+        job.start_tick = self.universe._tick
         self.current_state = "taking_pod"
         self.route_stop_points = None
         # print("called from assign_jobn_and_set_move_to_station")

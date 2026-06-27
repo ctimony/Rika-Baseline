@@ -46,7 +46,7 @@ OUTPUT_PATH = os.path.join(ROOT, "output", "06_sampled_skus.csv")
 # Pod budget = active SKU pods (layout.py total_pods_active) × slots per pod.
 ACTIVE_PODS    = 489
 SLOTS_PER_POD  = 20
-SLOT_BUDGET    = ACTIVE_PODS * SLOTS_PER_POD   # 9,780
+SLOT_BUDGET    = ACTIVE_PODS * SLOTS_PER_POD   # 9,780 (pod_generator fills every slot)
 PROTECT_CLASSES = ["A"]                         # ABC classes taken in full (never sampled)
 
 
