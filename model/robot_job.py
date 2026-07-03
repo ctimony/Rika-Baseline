@@ -6,6 +6,12 @@ from engine.netlogo_coordinate import NetLogoCoordinate
 from .tools.pod_location import upsert_pod_location
 
 
+# Replenishment processing time per SKU (seconds). Module-level so the capacity
+# sensitivity sweep can override it (higher delay = lower replenishment throughput
+# = under-replenishment). Default 20 matches Table 3.9.
+REPLENISH_DELAY_PER_SKU = 20
+
+
 class RobotJob:
     counter = 1
     def __init__(self, pod_coordinate: NetLogoCoordinate, station_id, pod):
@@ -19,7 +25,7 @@ class RobotJob:
         self.orders: list[tuple[int, int, int]] = []  # This will hold tuples of (order_id, sku, quantity)
         self.picking_delay_per_sku = 8 # Time for handling a task
         self.picking_delay = 0
-        self.replenishment_delay_per_sku = 20
+        self.replenishment_delay_per_sku = REPLENISH_DELAY_PER_SKU
         self.replenishment_delay = 0
         self.is_finished = False
         self.start_tick = None

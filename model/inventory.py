@@ -39,9 +39,9 @@ pd.set_option('display.max_colwidth', None)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)  # Let it auto-expand
 
-USE_OPPORTUNITY_SCORE = False     # True = Proactive ORS, False = baseline AND/OR gate with pod index
-BASELINE_KL = 0.2              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline). KL 0.2 over the TRUE pod SKU count (n_p=20) → trigger at >=4/20 (20%) critical SKUs — the SAME trigger as the old capped form (ΣW_i/8 >= 0.4), now with the genuine fraction denominator.
-BASELINE_UL = {'A': 0.6, 'B': 0.6, 'C': 0.6}  # Layer 1 utilization threshold per ABC class
+USE_OPPORTUNITY_SCORE = True     # True = Proactive ORS, False = baseline AND/OR gate with pod index
+BASELINE_KL = 0.7              # Only used when USE_OPPORTUNITY_SCORE = False (AND baseline). KL 0.2 over the TRUE pod SKU count (n_p=20) → trigger at >=4/20 (20%) critical SKUs — the SAME trigger as the old capped form (ΣW_i/8 >= 0.4), now with the genuine fraction denominator.
+BASELINE_UL = {'A': 0.5, 'B': 0.5, 'C': 0.5}  # Layer 1 utilization threshold per ABC class
 # Baseline version (only used when USE_OPPORTUNITY_SCORE = False):
 #   1 = AND/cascade with both layers required: a SKU must pass Layer 1 (flagged) AND
 #       the pod must pass Layer 2 (Q_p >= KL). Needs the stockout override (Layer 1+2
@@ -55,7 +55,7 @@ BASELINE_VERSION = 1
 # the AND baseline runs on its own logic ONLY (no override) — used to show the
 # baseline stalls / under-replenishes without the net. When True, the net catches
 # SKUs that hit zero stock as a last-resort floor.
-STOCKOUT_OVERRIDE_ENABLED = True
+STOCKOUT_OVERRIDE_ENABLED = False
 # v13 stockout safety net (DEADLOCK GUARD). Separate from the baseline override above.
 # When True and v13 is active, every scan interval we fetch ONE pod for each SKU whose
 # WAREHOUSE stock is truly zero (current_global_qty == 0) and is still fillable — so a
@@ -121,11 +121,20 @@ V12_FILL_RATE = 0.9
 # WHOLE-POD FILL: when True, a replenishment trip refills EVERY SKU in the pod (up to
 # V12_FILL_RATE × limit), not only the critical SKUs that triggered the trip. Since the
 # pod is already at the replenishment station, topping up all its SKUs ('free-ride')
-# raises pile-on and makes the pod stay full longer → fewer re-triggers / fewer trips,
+# raises pile-on and makes sthe pod stay full longer → fewer re-triggers / fewer trips,
 # at the cost of higher pod mass (energy) and cross-SKU contamination of the per-SKU
 # replenishment pattern. This is Kuo's proposed-policy behaviour (restock the whole
 # selected pod to max). False = critical-only (cleaner per-SKU, more trips).
 V12_FILL_WHOLE_POD = True
+# REPLENISH SCOPE KNOB (v19/v20 energy DoE): when True, a replenishment trip refills ONLY
+# the critical SKUs that triggered the trip (the `reserved` set), NOT the whole pod — even
+# for v15/v16/v19/v20 which otherwise force whole-pod fill. This makes each trip carry LESS
+# added mass (lighter pod) but the pod re-triggers sooner (more frequent trips). It exposes
+# the mass-per-trip ↔ trip-frequency trade-off that whole-pod fill hides: whole-pod = few
+# heavy trips, critical-only = many light trips. Used to test whether the throughput↔energy
+# trade-off emerges when replenishment energy is concentrated per-trip. False = whole-pod
+# (current v20 behaviour, unchanged). True = critical-only override.
+REPLENISH_CRITICAL_ONLY = False
 # Score_p = W_G·g_pod + W_E·emptiness_pod, where
 #   g_pod        = MAX over the pod's CRITICAL SKUs of (rop_global−cur_global)/rop_global
 #                  — how close the most-critical SKU is to a WAREHOUSE stockout (service).
@@ -265,7 +274,7 @@ class Inventory(Universe):
         # v13 stockout safety net (deadlock guard) — same scan as the baseline net, but
         # gated on v13 being active. Fires ONLY for true zero-stock SKUs, identically
         # across all weights, so it does not distort the weight comparison.
-        if V13_STOCKOUT_NET and USE_OPPORTUNITY_SCORE and ORS_VERSION in (12, 13, 14, 15, 16, 17, 19, 20):
+        if V13_STOCKOUT_NET and USE_OPPORTUNITY_SCORE and ORS_VERSION in (12, 13, 14, 15, 16, 17, 19, 20, 21):
             if int(self._tick) % 3600 == 0:
                 self._stockout_skus = {
                     sku for sku, data in self.pod_manager.skus_data.items()
@@ -384,8 +393,14 @@ class Inventory(Universe):
                     tick_load_mass += getattr(o, 'load_mass', 0.0)
                     tick_moving_robots += 1
 
-                # Handle job completion and replenishment
-                if o.job is not None and o.job.picking_delay == 0 and not o.job.is_finished:
+                # Handle job completion and replenishment.
+                # Gate on BOTH delays (not is_being_processed) so a REPLENISHMENT job
+                # completes only after replenishment_delay counts down — not instantly.
+                # picking_delay==0 alone was true from the start for replenishment jobs
+                # (they carry no picking delay), releasing the station slot on arrival
+                # and defeating the max_robots capacity constraint. For picking jobs this
+                # is equivalent to the old check (replenishment_delay==0 there).
+                if o.job is not None and not o.job.is_being_processed() and not o.job.is_finished:
                     need_replenish_pod = self.finish_task_in_job(o.job, robot=o)
                     for triplet in o.job.orders:
                         update_job_task(
@@ -579,7 +594,7 @@ class Inventory(Universe):
             # (Σ max(0,rop−cur)·(lim−cur) over ALL SKUs, no divisor) instead of v15's
             # Σ g·(1−cur/lim). Routes through the v14 dispatch; the score branch inside
             # picks _v19_pod_score when ORS_VERSION == 19. v14/v15 stay untouched.
-            if ORS_VERSION in (14, 15, 19, 20):
+            if ORS_VERSION in (14, 15, 19, 20, 21):
                 picked_skus = {sku for _, sku, _ in job.orders}
                 return self._dispatch_piggyback_ranked_v14(picked_pod=pod,
                                                            picking_robot=robot,
@@ -685,10 +700,12 @@ class Inventory(Universe):
             # avoids free-riding non-critical SKUs (cleaner per-SKU pattern, lower pod
             # mass). The stockout override still fills ONLY the stocked-out SKU.
             whole_pod_fill = False
-        elif ORS_VERSION in (15, 16, 19, 20):
-            # v15/v16/v19 ALWAYS whole-pod (their whole point); stockout override still
-            # critical-only.
-            whole_pod_fill = not stockout_fill
+        elif ORS_VERSION in (15, 16, 19, 20, 21):
+            # v15/v16/v19/v20 ALWAYS whole-pod (their whole point); stockout override still
+            # critical-only. KNOB: REPLENISH_CRITICAL_ONLY forces critical-only fill even for
+            # these versions, so a trip refills only the triggering (reserved) SKUs → lighter
+            # pod, more frequent trips (energy DoE).
+            whole_pod_fill = (not stockout_fill) and (not REPLENISH_CRITICAL_ONLY)
         else:
             # Other opportunity-score policies: v13 (and any with V12_FILL_WHOLE_POD) =
             # whole-pod; v12, v14 and v17 = critical-only (v17 = v12 + g², so it must match
@@ -927,7 +944,11 @@ class Inventory(Universe):
         (critical) ones, so the reservation exactly matches the whole-pod refill that
         the trip will perform (reserve = fill). For all other versions the reservation
         is over the covered critical SKUs only (matching their critical-only fill)."""
-        if ORS_VERSION in (15, 16, 19, 20):
+        if ORS_VERSION in (15, 16, 19, 20, 21) and not REPLENISH_CRITICAL_ONLY:
+            # whole-pod fill → reserve EVERY SKU so reservation matches the refill.
+            # When REPLENISH_CRITICAL_ONLY is on, the trip fills only the covered
+            # (critical) SKUs, so the reservation must stay critical-only too — else
+            # reservation ≠ fill and trips/stockouts inflate (see docstring above).
             covered_skus = list(pod.skus.keys())
         pod.reserved_fill = {}
         for s_id in covered_skus:
@@ -1155,6 +1176,38 @@ class Inventory(Universe):
             if shortage <= 0:
                 continue                       # healthy SKU: contributes nothing
             score += min(shortage, cap)        # deliverable shortage this trip
+            covered.append(s_id)
+        return score, covered
+
+    def _v21_pod_score(self, pod, critical_set):
+        """v21 = v20 (MIN deliverable-shortage) but the empty space is capped at the
+        FILL-RATE target (φ × limit) instead of the full slot (limit). The capacity a
+        single trip can refill into SKU i is therefore (φ·limit_i − cur_i), so the
+        score reflects the shortage this pod can close GIVEN the fill rate that will
+        actually be applied at the replenishment station:
+            contribution_i = min( max(0, rop_i − current_global_i),  (φ·limit_i − cur_i) )
+        WARNING (documented in plan, 2026-06-24): because φ now enters the capacity
+        term, the fill rate changes BOTH pod mass AND pod selection — a SKU already
+        above φ·limit is skipped, so the candidate ranking shifts with φ. This was
+        previously reverted for producing non-monotonic (zigzag) throughput across
+        fill rates. Kept as a SEPARATE comparator (v20 and all other versions
+        untouched) for re-examination. Returns (score, covered)."""
+        skus_data = self.pod_manager.skus_data
+        score = 0.0
+        covered = []
+        for s_id, s in pod.skus.items():
+            cur = float(s.get('current_qty', 0))
+            lim = float(s.get('limit_qty', 0))
+            cap = (V12_FILL_RATE * lim) - cur   # capacity capped at fill-rate target
+            if cap <= 0:
+                continue                       # already at/above φ·limit — no room
+            d = skus_data.get(s_id, {})
+            rg = float(d.get('rop_global', 0))
+            cg = float(d.get('current_global_qty', 0))
+            shortage = max(0.0, rg - cg)       # UNITS, capped at 0 (healthy → 0)
+            if shortage <= 0:
+                continue                       # healthy SKU: contributes nothing
+            score += min(shortage, cap)        # deliverable shortage this trip, fill-capped
             covered.append(s_id)
         return score, covered
 
@@ -1864,6 +1917,8 @@ class Inventory(Universe):
                 rank, cov = self._v19_pod_score(pod, critical)   # Hsiao opportunity-cost (priority × cap)
             elif ORS_VERSION == 20:
                 rank, cov = self._v20_pod_score(pod, critical)   # MIN variant (deliverable shortage)
+            elif ORS_VERSION == 21:
+                rank, cov = self._v21_pod_score(pod, critical)   # MIN variant, fill-rate-capped
             else:
                 rank, cov = self._v11_pod_score(pod, critical)   # scored over WHOLE critical set (v14/v15)
             if not cov:

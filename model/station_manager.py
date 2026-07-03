@@ -6,6 +6,13 @@ import pandas as pd
 import numpy as np
 
 
+# Replenishment station capacity (max concurrent committed pods). Module-level so
+# the capacity sensitivity sweep can override it (lower value = fewer pods can be
+# replenished at once = under-replenishment). Default 9 matches the current model;
+# applied to replenishment stations only, so picking capacity is untouched.
+REPLENISH_MAX_ROBOTS = 3
+
+
 class StationManager:
     def __init__(self):
         self.stations: List[Station] = []
@@ -35,12 +42,21 @@ class StationManager:
         # Initialize the minimum number of orders to a high value to find the station with the least orders
         min_robots = float('inf')
 
+        # Capacity gate counts EVERY committed pod (in-transit + at-station) via
+        # incoming_pod, so a station is full once max_robots pods are committed to it,
+        # INCLUDING pods still travelling. This makes max_robots a TRUE capacity
+        # constraint (required for the replenishment-capacity sensitivity sweep). At
+        # the default max_robots=9 the station is over-provisioned, so counting
+        # committed pods is identical to counting only arrived robots — the main
+        # (lead x fill) experiment is unaffected. Applies to all dispatch paths,
+        # baseline and proposed alike (symmetric).
         # Iterate through each station to check the number of orders
         for station in self.replenishment_stations:
-            if len(station.robot_ids) < station.max_robots:
+            load = len(station.incoming_pod)
+            if load < station.max_robots:
                 # Check if this station has fewer orders than the current minimum
-                if len(station.robot_ids) < min_robots:
-                    min_robots = len(station.robot_ids)
+                if load < min_robots:
+                    min_robots = load
                     available_station = station
 
         return available_station
@@ -128,6 +144,7 @@ class StationManager:
         if station.is_picker_station():
             self.picking_stations.append(station)
         elif station.is_replenishment_station():
+            station.max_robots = REPLENISH_MAX_ROBOTS   # capacity-sweep override (repl only)
             self.replenishment_stations.append(station)
 
     def get_station_by_id(self, station_id):

@@ -115,7 +115,7 @@ class Pod(Object):
         """
         if not self.skus or not flagged_skus:
             return False
-        n_p = len(self.skus)
+        n_p = min(len(self.skus), 8)   # denominator capped at 8 (SKU-per-pod range)
         if n_p <= 0:
             return False
         # W_i binary: count flagged SKUs actually present in this pod (each = 1).

@@ -66,12 +66,12 @@ POD3_SLOT_VOL = 60_000  # cm³
 # Initial stock covers one calendar day (24 h) for every pattern. Smooth/erratic
 # use 24 hours of Normal demand directly; intermittent/lumpy convert the 24-h day
 # into n_act/day bursts of burst-size demand. ROP is the lead time (1 h / 1 burst).
-INIT_HORIZON_SE_HOURS = 24   # smooth/erratic initial stock = one day
-ROP_HORIZON_SE_HOURS  = 2.0    # smooth/erratic ROP lead time = 1 hour
+INIT_HORIZON_SE_HOURS = 8   # smooth/erratic initial stock = one day
+ROP_HORIZON_SE_HOURS  = 1.0    # smooth/erratic ROP lead time = 1 hour
 ROP_HORIZON_IL_BURSTS  = 3   # intermittent/lumpy ROP = 1 burst
 
 # Service level (Z) is a function of ABC class ONLY — a proxy for item
-# criticality (A items most critical → highest availability), per standard
+# criticality (A items most critical → hisghest availability), per standard
 # inventory practice (Silver, Pyke & Peterson 1998). It is NOT a function of
 # cv_class: the legacy cv (total CV including zero-demand days) is misleading for
 # intermittent SKUs (high cv from sparsity, not size variability). Demand-size
